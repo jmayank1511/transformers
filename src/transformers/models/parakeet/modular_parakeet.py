@@ -31,7 +31,14 @@ from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from ..fastspeech2_conformer.modeling_fastspeech2_conformer import FastSpeech2ConformerConvolutionModule
 from ..llama.modeling_llama import LlamaAttention, eager_attention_forward
-from .configuration_parakeet import ParakeetCTCConfig, ParakeetEncoderConfig
+from .configuration_parakeet import (
+    ParakeetCTCConfig,
+    ParakeetEncoderConfig,
+    ParakeetJointNetworkConfig,
+    ParakeetPredictionNetworkConfig,
+    ParakeetRNNTConfig,
+    ParakeetTDTConfig,
+)
 
 
 @dataclass
@@ -346,13 +353,18 @@ class ParakeetPreTrainedModel(PreTrainedModel):
             init.normal_(module.bias_u, mean=0.0, std=std)
             init.normal_(module.bias_v, mean=0.0, std=std)
         elif isinstance(module, ParakeetEncoderRelPositionalEncoding):
+            encoder_config = self.config.encoder_config if hasattr(self.config, "encoder_config") else self.config
             inv_freq = 1.0 / (
-                10000.0 ** (torch.arange(0, self.config.hidden_size, 2, dtype=torch.int64) / self.config.hidden_size)
+                10000.0
+                ** (
+                    torch.arange(0, encoder_config.hidden_size, 2, dtype=torch.int64)
+                    / encoder_config.hidden_size
+                )
             )
             init.copy_(module.inv_freq, inv_freq)
 
     def _get_subsampling_output_length(self, input_lengths: torch.Tensor):
-        encoder_config = self.config.encoder_config if isinstance(self.config, ParakeetCTCConfig) else self.config
+        encoder_config = self.config.encoder_config if hasattr(self.config, "encoder_config") else self.config
 
         kernel_size = encoder_config.subsampling_conv_kernel_size
         stride = encoder_config.subsampling_conv_stride
@@ -651,4 +663,1005 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
         return sequences
 
 
-__all__ = ["ParakeetForCTC", "ParakeetEncoder", "ParakeetPreTrainedModel"]
+class ParakeetRNNTLoss(nn.Module):
+    """
+    Pure-PyTorch RNNT loss via the forward-backward algorithm on a T×U lattice.
+
+    Ports NeMo's ``RNNTLossPytorch`` with no additional dependencies.  For
+    production use a warp-RNNT kernel backend can be substituted here without
+    changing any calling code.
+
+    Args:
+        blank: Index of the blank token (must equal ``vocab_size - 1``).
+        reduction: Per-sample reduction.  One of ``"mean_batch"``,
+            ``"mean"``, ``"sum"``, ``"mean_volume"``.
+    """
+
+    def __init__(self, blank: int, reduction: str = "mean_batch"):
+        super().__init__()
+        self.blank = blank
+        self.reduction = reduction
+
+    def forward(
+        self,
+        acts: torch.Tensor,
+        labels: torch.Tensor,
+        act_lens: torch.Tensor,
+        label_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            acts: Joint logits of shape ``[B, T, U, V + 1]``.  *Not*
+                log-softmax'd — this method applies log-softmax internally.
+            labels: Target token ids of shape ``[B, U - 1]``.
+            act_lens: Valid encoder-output lengths, shape ``[B]``.
+            label_lens: Valid label lengths, shape ``[B]``.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        # CPU fp16 → fp32 for numerical stability
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        log_probs = torch.log_softmax(acts, dim=-1)
+        forward_log_probs = self._compute_forward_prob(log_probs, labels, act_lens, label_lens)
+        losses = -forward_log_probs
+        return self._reduce(losses, label_lens)
+
+    def _compute_forward_prob(
+        self,
+        log_probs: torch.Tensor,
+        labels: torch.Tensor,
+        act_lens: torch.Tensor,
+        label_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        B, T, U, _ = log_probs.shape
+
+        # log_alpha[b, t, u] = log P(alignment prefix uses frames 0..t and emits labels 0..u-1)
+        log_alpha = torch.zeros(B, T, U, device=log_probs.device, dtype=log_probs.dtype)
+
+        for t in range(T):
+            for u in range(U):
+                if u == 0:
+                    if t == 0:
+                        log_alpha[:, t, u] = 0.0
+                    else:
+                        # (t-1, 0) blank transition
+                        log_alpha[:, t, u] = log_alpha[:, t - 1, u] + log_probs[:, t - 1, 0, self.blank]
+                else:
+                    if t == 0:
+                        # (0, u-1) label transition
+                        label_scores = torch.gather(
+                            log_probs[:, t, u - 1],
+                            dim=1,
+                            index=labels[:, u - 1].unsqueeze(1).long(),
+                        ).squeeze(1)
+                        log_alpha[:, t, u] = log_alpha[:, t, u - 1] + label_scores
+                    else:
+                        # blank: (t-1, u) → (t, u)
+                        blank_path = log_alpha[:, t - 1, u] + log_probs[:, t - 1, u, self.blank]
+                        # label: (t, u-1) → (t, u)
+                        label_scores = torch.gather(
+                            log_probs[:, t, u - 1],
+                            dim=1,
+                            index=labels[:, u - 1].unsqueeze(1).long(),
+                        ).squeeze(1)
+                        label_path = log_alpha[:, t, u - 1] + label_scores
+                        log_alpha[:, t, u] = torch.logaddexp(blank_path, label_path)
+
+        # Terminal: alpha[T_b-1, U_b] + blank(T_b-1, U_b)
+        terminal_log_probs = torch.stack(
+            [
+                log_alpha[b, act_lens[b] - 1, label_lens[b]]
+                + log_probs[b, act_lens[b] - 1, label_lens[b], self.blank]
+                for b in range(B)
+            ]
+        )
+        return terminal_log_probs
+
+    def _reduce(self, losses: torch.Tensor, label_lens: torch.Tensor) -> torch.Tensor:
+        if self.reduction == "mean_batch":
+            return losses.mean()
+        elif self.reduction == "mean":
+            return torch.div(losses, label_lens).mean()
+        elif self.reduction == "sum":
+            return losses.sum()
+        elif self.reduction == "mean_volume":
+            return losses.sum() / label_lens.sum()
+        return losses
+
+
+class ParakeetTDTLoss(nn.Module):
+    """
+    Pure-PyTorch TDT (Token-and-Duration Transducer) loss.
+
+    Ports NeMo's ``TDTLossPytorch`` and adds the RNNT regularisation term
+    weighted by ``omega``.  The combined objective is::
+
+        loss = omega * rnnt_loss + (1 - omega) * tdt_loss
+
+    where both components use sigma-underhnormalised label logits as described
+    in `Efficient Sequence Transduction by Jointly Predicting Tokens and
+    Durations <https://arxiv.org/abs/2304.06795>`__.
+
+    Args:
+        blank: Index of the blank token.
+        durations: Ordered candidate frame-skip values (must include 0 and at
+            least one positive integer), e.g. ``[0, 1, 2, 3, 4]``.
+        reduction: Per-sample reduction.  One of ``"mean_batch"``,
+            ``"mean"``, ``"sum"``, ``"mean_volume"``.
+        sigma: Log-domain under-normalisation coefficient applied to label
+            logits before computing the forward probability.
+        omega: Weight of the RNNT regularisation term.  Set to 0 to use
+            the pure TDT objective.
+    """
+
+    def __init__(
+        self,
+        blank: int,
+        durations: list[int],
+        reduction: str = "mean_batch",
+        sigma: float = 0.05,
+        omega: float = 0.1,
+    ):
+        super().__init__()
+        self.blank = blank
+        self.durations = durations
+        self.n_durations = len(durations)
+        self.reduction = reduction
+        self.sigma = sigma
+        self.omega = omega
+        self._rnnt_loss = ParakeetRNNTLoss(blank=blank, reduction=reduction)
+
+    def forward(
+        self,
+        acts: torch.Tensor,
+        labels: torch.Tensor,
+        act_lens: torch.Tensor,
+        label_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            acts: Joint logits of shape ``[B, T, U, V + 1 + num_durations]``.
+                *Not* log-softmax'd.
+            labels: Target token ids of shape ``[B, U - 1]``.
+            act_lens: Valid encoder-output lengths, shape ``[B]``.
+            label_lens: Valid label lengths, shape ``[B]``.
+
+        Returns:
+            Scalar combined TDT loss.
+        """
+        label_acts = acts[:, :, :, : -self.n_durations]
+        duration_acts = acts[:, :, :, -self.n_durations :]
+
+        # sigma under-normalisation on label logits; duration logits are normalised normally
+        log_label_acts = torch.log_softmax(label_acts, dim=-1) - self.sigma
+        log_duration_acts = torch.log_softmax(duration_acts, dim=-1)
+
+        tdt_forward_log_probs = self._compute_tdt_forward_prob(
+            log_label_acts, log_duration_acts, labels, act_lens, label_lens
+        )
+        tdt_losses = -tdt_forward_log_probs
+        tdt_loss = self._reduce(tdt_losses, label_lens)
+
+        if self.omega == 0.0:
+            return tdt_loss
+
+        # RNNT regularisation term: standard RNNT loss on the sigma-normalised label logits.
+        # We pass pre-softmax'd label_acts to ParakeetRNNTLoss, which re-applies log_softmax.
+        # To avoid double-softmax we build a thin wrapper that takes already-log-softmax'd input.
+        rnnt_forward_log_probs = self._rnnt_loss._compute_forward_prob(
+            log_label_acts, labels, act_lens, label_lens
+        )
+        rnnt_losses = -rnnt_forward_log_probs
+        rnnt_loss = self._rnnt_loss._reduce(rnnt_losses, label_lens)
+
+        return self.omega * rnnt_loss + (1.0 - self.omega) * tdt_loss
+
+    def _compute_tdt_forward_prob(
+        self,
+        log_label_acts: torch.Tensor,
+        log_duration_acts: torch.Tensor,
+        labels: torch.Tensor,
+        act_lens: torch.Tensor,
+        label_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        B, T, U, _ = log_label_acts.shape
+
+        NEG_INF = -1000.0
+        log_alpha = torch.full((B, T, U), NEG_INF, device=log_label_acts.device, dtype=log_label_acts.dtype)
+
+        for b in range(B):
+            for t in range(T):
+                for u in range(U):
+                    if u == 0:
+                        if t == 0:
+                            log_alpha[b, t, u] = 0.0
+                        else:
+                            # only blank transitions reach (t, 0) for t > 0
+                            for n, dur in enumerate(self.durations):
+                                if dur > 0 and t - dur >= 0:
+                                    tmp = (
+                                        log_alpha[b, t - dur, u]
+                                        + log_label_acts[b, t - dur, u, self.blank]
+                                        + log_duration_acts[b, t - dur, u, n]
+                                    )
+                                    log_alpha[b, t, u] = torch.logaddexp(
+                                        log_alpha[b, t, u],
+                                        tmp,
+                                    )
+                    else:
+                        for n, dur in enumerate(self.durations):
+                            if t - dur >= 0:
+                                if dur > 0:
+                                    # blank transition from (t-dur, u)
+                                    tmp = (
+                                        log_alpha[b, t - dur, u]
+                                        + log_label_acts[b, t - dur, u, self.blank]
+                                        + log_duration_acts[b, t - dur, u, n]
+                                    )
+                                    log_alpha[b, t, u] = torch.logaddexp(log_alpha[b, t, u], tmp)
+                                # label transition from (t-dur, u-1)
+                                tmp = (
+                                    log_alpha[b, t - dur, u - 1]
+                                    + log_label_acts[b, t - dur, u - 1, labels[b, u - 1]]
+                                    + log_duration_acts[b, t - dur, u - 1, n]
+                                )
+                                log_alpha[b, t, u] = torch.logaddexp(log_alpha[b, t, u], tmp)
+
+        # Collect terminal probabilities: sum over all valid ending blank durations
+        terminal_log_probs = []
+        for b in range(B):
+            t_b = act_lens[b].item()
+            u_b = label_lens[b].item()
+            log_prob = torch.tensor(NEG_INF, device=log_label_acts.device, dtype=log_label_acts.dtype)
+            for n, dur in enumerate(self.durations):
+                if dur > 0 and t_b - dur >= 0:
+                    tmp = (
+                        log_alpha[b, t_b - dur, u_b]
+                        + log_label_acts[b, t_b - dur, u_b, self.blank]
+                        + log_duration_acts[b, t_b - dur, u_b, n]
+                    )
+                    log_prob = torch.logaddexp(log_prob, tmp)
+            terminal_log_probs.append(log_prob)
+        return torch.stack(terminal_log_probs)
+
+    def _reduce(self, losses: torch.Tensor, label_lens: torch.Tensor) -> torch.Tensor:
+        return self._rnnt_loss._reduce(losses, label_lens)
+
+
+class ParakeetPredictionNetwork(nn.Module):
+    """
+    LSTM-based prediction network (decoder) for RNNT and TDT models.
+
+    Args:
+        config: Prediction network configuration.
+        vocab_size: Full vocabulary size *including* the blank token.
+        blank_id: Index of the blank token.  When ``config.blank_as_pad`` is
+            ``True`` the blank embedding is tied to the zero vector via
+            ``padding_idx``, eliminating a special-case branch in the decode
+            loop and enabling CUDA-graph capture.
+    """
+
+    def __init__(
+        self,
+        config: ParakeetPredictionNetworkConfig,
+        vocab_size: int,
+        blank_id: int,
+    ):
+        super().__init__()
+        self.pred_hidden = config.pred_hidden
+        self.pred_rnn_layers = config.pred_rnn_layers
+        self.blank_as_pad = config.blank_as_pad
+        self.blank_id = blank_id
+
+        padding_idx = blank_id if config.blank_as_pad else None
+        self.embed = nn.Embedding(vocab_size, config.pred_hidden, padding_idx=padding_idx)
+
+        # nn.LSTM dropout is only applied between layers, so it is 0 for single-layer models
+        lstm_dropout = config.dropout if config.pred_rnn_layers > 1 else 0.0
+        self.lstm = nn.LSTM(
+            input_size=config.pred_hidden,
+            hidden_size=config.pred_hidden,
+            num_layers=config.pred_rnn_layers,
+            batch_first=True,
+            dropout=lstm_dropout,
+        )
+
+    def forward(
+        self,
+        labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Training forward pass — processes the full label sequence in one call.
+
+        Args:
+            labels: Token ids of shape ``[B, U]``.
+            label_lengths: Valid label counts of shape ``[B]`` (unused for
+                padding but kept for API consistency).
+            state: Optional initial LSTM state ``(h, c)``, each of shape
+                ``[num_layers, B, pred_hidden]``.
+
+        Returns:
+            Tuple of ``(output, (h_n, c_n))`` where *output* has shape
+            ``[B, U + 1, pred_hidden]`` (SOS prepended as a zero vector) and
+            *(h_n, c_n)* are the final LSTM hidden and cell states.
+        """
+        B = labels.size(0)
+        embedded = self.embed(labels)  # [B, U, H]
+
+        # Prepend blank "start-of-sequence" as a zero vector
+        sos = torch.zeros(B, 1, self.pred_hidden, device=labels.device, dtype=embedded.dtype)
+        embedded = torch.cat([sos, embedded], dim=1)  # [B, U+1, H]
+
+        output, (h_n, c_n) = self.lstm(embedded, state)  # [B, U+1, H]
+        return output, (h_n, c_n)
+
+    def predict(
+        self,
+        y: torch.Tensor | None,
+        state: tuple[torch.Tensor, torch.Tensor] | None,
+        batch_size: int | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Single-step prediction for greedy / beam-search decoding.
+
+        Args:
+            y: Last emitted token ids of shape ``[B, 1]``, or ``None`` to
+               emit a zero vector (used for the very first SOS step).
+            state: Current LSTM state ``(h, c)`` or ``None`` for the initial
+                zero state.
+            batch_size: Required when both ``y`` and ``state`` are ``None``.
+
+        Returns:
+            Tuple of ``(output, (h_n, c_n))`` where *output* has shape
+            ``[B, 1, pred_hidden]``.
+        """
+        device = self.embed.weight.device
+        dtype = self.embed.weight.dtype
+
+        if y is not None:
+            embedded = self.embed(y)  # [B, 1, H]
+        else:
+            if batch_size is None:
+                batch_size = state[0].size(1) if state is not None else 1
+            embedded = torch.zeros(batch_size, 1, self.pred_hidden, device=device, dtype=dtype)
+
+        output, (h_n, c_n) = self.lstm(embedded, state)
+        return output, (h_n, c_n)
+
+    def initialize_state(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return zero-initialised ``(h, c)`` LSTM state for ``batch_size`` sequences."""
+        h = torch.zeros(self.pred_rnn_layers, batch_size, self.pred_hidden, device=device, dtype=dtype)
+        c = torch.zeros(self.pred_rnn_layers, batch_size, self.pred_hidden, device=device, dtype=dtype)
+        return h, c
+
+
+class ParakeetJointNetwork(nn.Module):
+    """
+    Joint network for RNNT and TDT models.
+
+    Projects encoder and prediction-network outputs to a shared hidden space,
+    sums them element-wise, applies an activation, and maps to vocabulary
+    (plus optional extra) logits.
+
+    Args:
+        config: Joint network configuration.
+        encoder_hidden: Hidden size of the encoder output.
+        pred_hidden: Hidden size of the prediction network output.
+        vocab_size: Vocabulary size *including* the blank token.
+    """
+
+    def __init__(
+        self,
+        config: ParakeetJointNetworkConfig,
+        encoder_hidden: int,
+        pred_hidden: int,
+        vocab_size: int,
+    ):
+        super().__init__()
+        self.enc_proj = nn.Linear(encoder_hidden, config.joint_hidden)
+        self.pred_proj = nn.Linear(pred_hidden, config.joint_hidden)
+        self.activation = ACT2FN[config.activation]
+        self.dropout = nn.Dropout(p=config.dropout)
+        # vocab_size already includes blank; num_extra_outputs adds duration heads for TDT
+        self.out_proj = nn.Linear(config.joint_hidden, vocab_size + config.num_extra_outputs)
+
+    def project_encoder(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        """Project encoder output ``[B, T, enc_hidden]`` → ``[B, T, joint_hidden]``."""
+        return self.enc_proj(encoder_output)
+
+    def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
+        """Project prediction-net output ``[B, U, pred_hidden]`` → ``[B, U, joint_hidden]``."""
+        return self.pred_proj(prednet_output)
+
+    def joint_after_projection(
+        self,
+        f: torch.Tensor,
+        g: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Combine already-projected encoder and prediction-net outputs.
+
+        Args:
+            f: Projected encoder output, shape ``[B, T, joint_hidden]`` or
+               ``[B, 1, joint_hidden]`` for a single time-step.
+            g: Projected prediction-net output, shape ``[B, U, joint_hidden]``
+               or ``[B, 1, joint_hidden]`` for a single label step.
+
+        Returns:
+            Logits of shape ``[B, T, U, vocab_size + num_extra_outputs]``.
+        """
+        f = f.unsqueeze(2)  # [B, T, 1, H]
+        g = g.unsqueeze(1)  # [B, 1, U, H]
+        out = self.activation(f + g)  # [B, T, U, H]
+        out = self.dropout(out)
+        return self.out_proj(out)  # [B, T, U, V + extras]
+
+    def forward(
+        self,
+        encoder_output: torch.Tensor,
+        prednet_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Full joint forward (projects + combines).
+
+        Args:
+            encoder_output: ``[B, T, enc_hidden]``
+            prednet_output: ``[B, U, pred_hidden]``
+
+        Returns:
+            Logits ``[B, T, U, vocab_size + num_extra_outputs]``.
+        """
+        return self.joint_after_projection(
+            self.project_encoder(encoder_output),
+            self.project_prednet(prednet_output),
+        )
+
+
+@dataclass
+class ParakeetTransducerModelOutput(ModelOutput):
+    """
+    Outputs for ``ParakeetForRNNT`` and ``ParakeetForTDT``.
+
+    Args:
+        loss (`torch.FloatTensor`, *optional*):
+            Transducer loss, present when ``labels`` are supplied.
+        logits (`torch.FloatTensor` of shape ``[B, T, U, V]``, *optional*):
+            Raw joint-network logits.  Only returned when ``return_logits=True``
+            to avoid materialising the large ``T × U`` tensor during inference.
+        encoder_last_hidden_state (`torch.FloatTensor` of shape ``[B, T, H]``, *optional*):
+            Encoder output hidden states.
+        encoder_attention_mask (`torch.LongTensor` of shape ``[B, T]``, *optional*):
+            Encoder output attention mask after subsampling.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    encoder_last_hidden_state: torch.FloatTensor | None = None
+    encoder_attention_mask: torch.LongTensor | None = None
+
+
+@auto_docstring(
+    custom_intro="""
+    Parakeet model with an RNNT (RNN-Transducer) head for automatic speech recognition.
+
+    The model is composed of a FastConformer encoder, an LSTM prediction network, and
+    a joint network. At inference time, ``generate()`` runs batched frame-looping greedy
+    decoding.
+    """
+)
+class ParakeetForRNNT(ParakeetPreTrainedModel):
+    config: ParakeetRNNTConfig
+
+    def __init__(self, config: ParakeetRNNTConfig):
+        super().__init__(config)
+        self.encoder = ParakeetEncoder(config.encoder_config)
+        self.prediction_network = ParakeetPredictionNetwork(
+            config.prediction_network_config,
+            vocab_size=config.vocab_size,
+            blank_id=config.blank_id,
+        )
+        self.joint_network = ParakeetJointNetwork(
+            config.joint_network_config,
+            encoder_hidden=config.encoder_config.hidden_size,
+            pred_hidden=config.prediction_network_config.pred_hidden,
+            vocab_size=config.vocab_size,
+        )
+        self.post_init()
+
+    @auto_docstring
+    @can_return_tuple
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        label_lengths: torch.Tensor | None = None,
+        return_logits: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> ParakeetTransducerModelOutput:
+        r"""
+        labels (`torch.LongTensor` of shape ``[B, U]``, *optional*):
+            Target token ids for computing the RNNT loss.  Padded positions
+            should be filled with ``config.blank_id``.
+        label_lengths (`torch.LongTensor` of shape ``[B]``, *optional*):
+            Number of valid tokens in each row of ``labels``.  Required when
+            ``labels`` is provided.
+        return_logits (`bool`, *optional*, defaults to ``False``):
+            Whether to return the joint-network logits tensor ``[B, T, U, V]``.
+            Materialising this tensor is memory-intensive at training time.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoProcessor, ParakeetForRNNT
+        >>> from datasets import load_dataset, Audio
+
+        >>> model_id = "nvidia/parakeet-rnnt-1.1b"
+        >>> processor = AutoProcessor.from_pretrained(model_id)
+        >>> model = ParakeetForRNNT.from_pretrained(model_id)
+
+        >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+        >>> ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+
+        >>> inputs = processor(ds[0]["audio"]["array"])
+        >>> transcription = model.generate(**inputs)
+        >>> print(processor.batch_decode(transcription))
+        ```
+        """
+        encoder_outputs = self.encoder(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        encoder_hidden = encoder_outputs.last_hidden_state  # [B, T, enc_hidden]
+
+        loss = None
+        logits = None
+
+        if labels is not None:
+            if label_lengths is None:
+                raise ValueError("`label_lengths` must be provided when `labels` is supplied.")
+
+            pred_output, _ = self.prediction_network(labels, label_lengths)  # [B, U+1, pred_hidden]
+            logits = self.joint_network(encoder_hidden, pred_output)  # [B, T, U+1, V]
+
+            input_lengths = self._get_subsampling_output_length(
+                attention_mask.sum(-1) if attention_mask is not None else torch.full(
+                    (input_features.size(0),), input_features.size(1),
+                    dtype=torch.long, device=input_features.device,
+                )
+            )
+            loss_fn = ParakeetRNNTLoss(blank=self.config.blank_id, reduction=self.config.rnnt_loss_reduction)
+            loss = loss_fn(logits, labels, input_lengths, label_lengths)
+
+        if not return_logits:
+            logits = None
+
+        return ParakeetTransducerModelOutput(
+            loss=loss,
+            logits=logits,
+            encoder_last_hidden_state=encoder_hidden,
+            encoder_attention_mask=encoder_outputs.attention_mask,
+        )
+
+    def _pred_step(
+        self,
+        last_label: torch.Tensor | int,
+        state: tuple[torch.Tensor, torch.Tensor] | None,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """One prediction-network step for the greedy decoder.
+
+        Args:
+            last_label: Either a scalar SOS sentinel (``self.config.blank_id``)
+                for the very first step, or a ``[B, 1]`` long tensor of the
+                most recently emitted label for each item in the batch.
+            state: Current LSTM state or ``None``.
+            batch_size: Batch size (needed when ``last_label`` is a scalar).
+
+        Returns:
+            Tuple of projected prediction-network output ``[B, 1, pred_hidden]``
+            and updated LSTM state.
+        """
+        if isinstance(last_label, int):
+            # SOS: emit zero vector
+            y = None
+        else:
+            y = last_label  # [B, 1]
+        return self.prediction_network.predict(y, state, batch_size=batch_size)
+
+    def _joint_step(
+        self,
+        f: torch.Tensor,
+        g: torch.Tensor,
+        log_normalize: bool | None = None,
+    ) -> torch.Tensor:
+        """Single joint-network step.
+
+        Args:
+            f: Encoder frame, shape ``[B, 1, enc_hidden]``.
+            g: Prediction-network output, shape ``[B, 1, pred_hidden]``.
+            log_normalize: Whether to apply log-softmax.  ``None`` means apply
+                only on CPU (matching NeMo behaviour).
+
+        Returns:
+            Logits or log-probs of shape ``[B, 1, 1, V]``.
+        """
+        out = self.joint_network(f, g)  # [B, 1, 1, V]
+        should_normalize = (log_normalize is True) or (log_normalize is None and not out.is_cuda)
+        if should_normalize:
+            out = torch.log_softmax(out, dim=-1)
+        return out
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        return_dict_in_generate: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> ParakeetGenerateOutput | torch.LongTensor:
+        r"""
+        Greedy frame-looping RNNT decoding.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoProcessor, ParakeetForRNNT
+        >>> from datasets import load_dataset, Audio
+
+        >>> model_id = "nvidia/parakeet-rnnt-1.1b"
+        >>> processor = AutoProcessor.from_pretrained(model_id)
+        >>> model = ParakeetForRNNT.from_pretrained(model_id)
+
+        >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+        >>> ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+
+        >>> inputs = processor(ds[0]["audio"]["array"])
+        >>> transcription = model.generate(**inputs)
+        >>> print(processor.batch_decode(transcription))
+        ```
+        """
+        kwargs["return_dict"] = True
+        outputs: ParakeetTransducerModelOutput = self.forward(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        encoder_hidden = outputs.encoder_last_hidden_state  # [B, T, H]
+
+        if attention_mask is not None:
+            encoder_lengths = self._get_subsampling_output_length(attention_mask.sum(-1))
+        else:
+            encoder_lengths = torch.full(
+                (encoder_hidden.size(0),),
+                encoder_hidden.size(1),
+                dtype=torch.long,
+                device=encoder_hidden.device,
+            )
+
+        hypotheses = self._greedy_decode(encoder_hidden, encoder_lengths)
+        sequences = self._hypotheses_to_tensor(hypotheses, encoder_hidden.device)
+
+        if return_dict_in_generate:
+            return ParakeetGenerateOutput(sequences=sequences)
+        return sequences
+
+    def _greedy_decode(
+        self,
+        encoder_output: torch.Tensor,
+        encoder_output_length: torch.Tensor,
+    ) -> list[list[int]]:
+        """Batched frame-looping greedy RNNT decoding.
+
+        Args:
+            encoder_output: ``[B, T, enc_hidden]``
+            encoder_output_length: ``[B]`` valid frame counts.
+
+        Returns:
+            List of B token-id lists (blank tokens excluded).
+        """
+        B, _T, _H = encoder_output.shape
+        device = encoder_output.device
+        dtype = encoder_output.dtype
+
+        # Per-sample token sequences and scores
+        y_sequences: list[list[int]] = [[] for _ in range(B)]
+
+        state = self.prediction_network.initialize_state(B, device, dtype)
+        # last_label[b] = most recently emitted non-blank token id for sample b
+        last_label = torch.full((B, 1), fill_value=self.config.blank_id, dtype=torch.long, device=device)
+        blank_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
+        max_out_len = int(encoder_output_length.max().item())
+
+        # --- outer loop: one pass per encoder frame ---
+        for time_idx in range(max_out_len):
+            f = encoder_output[:, time_idx : time_idx + 1, :]  # [B, 1, H]
+
+            symbols_added = 0
+            blank_mask.fill_(False)
+            # samples whose valid length is <= time_idx are already done
+            blank_mask |= time_idx >= encoder_output_length
+
+            # --- inner loop: emit non-blank tokens until blank or max_symbols ---
+            not_blank = True
+            while not_blank and symbols_added < self.config.max_symbols_per_step:
+                if time_idx == 0 and symbols_added == 0 and all(
+                    state[0].abs().sum() == 0 for _ in [None]
+                ):
+                    g, state_prime = self._pred_step(self.config.blank_id, None, batch_size=B)
+                else:
+                    g, state_prime = self._pred_step(last_label, state, batch_size=B)
+
+                # logp: [B, V]  (squeeze T and U dimensions)
+                logp = self._joint_step(f, g, log_normalize=None)[:, 0, 0, :]
+                if logp.dtype != torch.float32:
+                    logp = logp.float()
+
+                # greedy pick
+                scores, k = logp.max(dim=1)  # [B]
+
+                k_is_blank = k == self.config.blank_id
+                blank_mask |= k_is_blank
+
+                if blank_mask.all():
+                    not_blank = False
+                else:
+                    # Update LSTM state only for samples that emitted a non-blank token
+                    not_blank_mask = ~blank_mask  # [B]
+                    # batch_replace_states_mask: in-place masked update (CUDA-graph friendly)
+                    torch.where(
+                        not_blank_mask.unsqueeze(0).unsqueeze(-1),  # [1, B, 1]
+                        state_prime[0],
+                        state[0],
+                        out=state[0],
+                    )
+                    torch.where(
+                        not_blank_mask.unsqueeze(0).unsqueeze(-1),
+                        state_prime[1],
+                        state[1],
+                        out=state[1],
+                    )
+
+                    # Update last_label for non-blank samples; keep previous for blank samples
+                    k_masked = torch.where(blank_mask, last_label.squeeze(1), k)
+                    last_label = k_masked.unsqueeze(1)
+
+                    # Record emitted non-blank tokens
+                    for b in range(B):
+                        if not blank_mask[b]:
+                            y_sequences[b].append(int(k[b].item()))
+
+                    symbols_added += 1
+
+        return y_sequences
+
+    def _hypotheses_to_tensor(
+        self,
+        hypotheses: list[list[int]],
+        device: torch.device,
+    ) -> torch.LongTensor:
+        """Pack variable-length hypotheses into a right-padded tensor."""
+        max_len = max((len(h) for h in hypotheses), default=0)
+        if max_len == 0:
+            return torch.zeros(len(hypotheses), 1, dtype=torch.long, device=device)
+        out = torch.full(
+            (len(hypotheses), max_len),
+            fill_value=self.config.blank_id,
+            dtype=torch.long,
+            device=device,
+        )
+        for b, hyp in enumerate(hypotheses):
+            if hyp:
+                out[b, : len(hyp)] = torch.tensor(hyp, dtype=torch.long, device=device)
+        return out
+
+
+@auto_docstring(
+    custom_intro="""
+    Parakeet model with a TDT (Token-and-Duration Transducer) head for automatic
+    speech recognition.
+
+    TDT extends RNNT by predicting both the emitted token *and* the number of
+    encoder frames to skip (the *duration*) at each decoding step.  The joint
+    network output is split into ``vocab_size`` label logits and
+    ``len(durations)`` duration logits.
+    """
+)
+class ParakeetForTDT(ParakeetForRNNT):
+    config: ParakeetTDTConfig
+
+    def __init__(self, config: ParakeetTDTConfig):
+        super().__init__(config)
+        # Joint network is already constructed by the parent with the correct
+        # num_extra_outputs (set to len(durations) in ParakeetTDTConfig.__post_init__)
+
+    @auto_docstring
+    @can_return_tuple
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        label_lengths: torch.Tensor | None = None,
+        return_logits: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> ParakeetTransducerModelOutput:
+        r"""
+        labels (`torch.LongTensor` of shape ``[B, U]``, *optional*):
+            Target token ids for computing the TDT loss.
+        label_lengths (`torch.LongTensor` of shape ``[B]``, *optional*):
+            Number of valid tokens in each row of ``labels``.
+        return_logits (`bool`, *optional*, defaults to ``False``):
+            Whether to return the joint-network logits tensor.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoProcessor, ParakeetForTDT
+        >>> from datasets import load_dataset, Audio
+
+        >>> model_id = "nvidia/parakeet-tdt-1.1b"
+        >>> processor = AutoProcessor.from_pretrained(model_id)
+        >>> model = ParakeetForTDT.from_pretrained(model_id)
+
+        >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+        >>> ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+
+        >>> inputs = processor(ds[0]["audio"]["array"])
+        >>> transcription = model.generate(**inputs)
+        >>> print(processor.batch_decode(transcription))
+        ```
+        """
+        encoder_outputs = self.encoder(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        encoder_hidden = encoder_outputs.last_hidden_state
+
+        loss = None
+        logits = None
+
+        if labels is not None:
+            if label_lengths is None:
+                raise ValueError("`label_lengths` must be provided when `labels` is supplied.")
+
+            pred_output, _ = self.prediction_network(labels, label_lengths)
+            logits = self.joint_network(encoder_hidden, pred_output)
+
+            input_lengths = self._get_subsampling_output_length(
+                attention_mask.sum(-1) if attention_mask is not None else torch.full(
+                    (input_features.size(0),), input_features.size(1),
+                    dtype=torch.long, device=input_features.device,
+                )
+            )
+            loss_fn = ParakeetTDTLoss(
+                blank=self.config.blank_id,
+                durations=self.config.durations,
+                reduction=self.config.rnnt_loss_reduction,
+                sigma=self.config.sigma,
+                omega=self.config.omega,
+            )
+            loss = loss_fn(logits, labels, input_lengths, label_lengths)
+
+        if not return_logits:
+            logits = None
+
+        return ParakeetTransducerModelOutput(
+            loss=loss,
+            logits=logits,
+            encoder_last_hidden_state=encoder_hidden,
+            encoder_attention_mask=encoder_outputs.attention_mask,
+        )
+
+    def _greedy_decode(
+        self,
+        encoder_output: torch.Tensor,
+        encoder_output_length: torch.Tensor,
+    ) -> list[list[int]]:
+        """Batched frame-looping greedy TDT decoding with duration prediction.
+
+        For non-blank emissions the duration is always 0 (stay at the same
+        frame and continue the inner loop).  For blank emissions the duration
+        gives the number of frames to skip before the next outer-loop step.
+        """
+        B, _T, _H = encoder_output.shape
+        device = encoder_output.device
+        dtype = encoder_output.dtype
+        n_dur = len(self.config.durations)
+        durations_tensor = torch.tensor(self.config.durations, dtype=torch.long, device=device)
+
+        y_sequences: list[list[int]] = [[] for _ in range(B)]
+
+        state = self.prediction_network.initialize_state(B, device, dtype)
+        last_label = torch.full((B, 1), fill_value=self.config.blank_id, dtype=torch.long, device=device)
+
+        # time_indices[b] = current frame position for each sample in the batch
+        time_indices = torch.zeros(B, dtype=torch.long, device=device)
+        last_valid = torch.clamp(encoder_output_length - 1, min=0)  # [B]
+
+        while (time_indices < encoder_output_length).any():
+            # Clamp to avoid out-of-bounds gather
+            safe_t = torch.minimum(time_indices, last_valid)
+            f = encoder_output[torch.arange(B, device=device), safe_t, :].unsqueeze(1)  # [B, 1, H]
+
+            symbols_added = 0
+            blank_mask = time_indices >= encoder_output_length  # [B]
+            frame_done = blank_mask.clone()
+
+            while not frame_done.all() and symbols_added < self.config.max_symbols_per_step:
+                g, state_prime = self._pred_step(last_label, state, batch_size=B)
+
+                joint_out = self._joint_step(f, g, log_normalize=None)[:, 0, 0, :]  # [B, V+D]
+                if joint_out.dtype != torch.float32:
+                    joint_out = joint_out.float()
+
+                label_logits = joint_out[:, :-n_dur]  # [B, V]
+                dur_logits = joint_out[:, -n_dur:]    # [B, D]
+
+                _, k = label_logits.max(dim=1)        # [B]
+                dur_idx = dur_logits.argmax(dim=1)    # [B]
+                predicted_dur = durations_tensor[dur_idx]  # [B]
+
+                k_is_blank = k == self.config.blank_id
+                blank_mask |= k_is_blank
+
+                # Blanks with duration 0 must advance by at least 1 to avoid infinite loop
+                safe_dur = torch.where(k_is_blank & (predicted_dur == 0), torch.ones_like(predicted_dur), predicted_dur)
+
+                not_blank_mask = ~blank_mask
+                # Update LSTM state for non-blank samples only (CUDA-graph–friendly masked write)
+                torch.where(
+                    not_blank_mask.unsqueeze(0).unsqueeze(-1),
+                    state_prime[0], state[0], out=state[0],
+                )
+                torch.where(
+                    not_blank_mask.unsqueeze(0).unsqueeze(-1),
+                    state_prime[1], state[1], out=state[1],
+                )
+
+                k_masked = torch.where(blank_mask, last_label.squeeze(1), k)
+                last_label = k_masked.unsqueeze(1)
+
+                for b in range(B):
+                    if not blank_mask[b]:
+                        y_sequences[b].append(int(k[b].item()))
+
+                # Advance time indices for samples that emitted blank
+                advance = k_is_blank & ~frame_done
+                time_indices = torch.where(advance, time_indices + safe_dur, time_indices)
+                frame_done |= blank_mask
+
+                symbols_added += 1
+
+            # After inner loop: samples that never went blank still advance by 1 via duration
+            # (handled above via safe_dur; but if loop exited due to max_symbols, force advance)
+            still_active = ~frame_done & (time_indices < encoder_output_length)
+            time_indices = torch.where(still_active, time_indices + 1, time_indices)
+
+        return y_sequences
+
+
+__all__ = [
+    "ParakeetForCTC",
+    "ParakeetForRNNT",
+    "ParakeetForTDT",
+    "ParakeetEncoder",
+    "ParakeetJointNetwork",
+    "ParakeetPredictionNetwork",
+    "ParakeetPreTrainedModel",
+    "ParakeetRNNTLoss",
+    "ParakeetTDTLoss",
+]
