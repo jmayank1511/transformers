@@ -34,6 +34,14 @@ Parakeet models, [introduced by NVIDIA NeMo](https://developer.nvidia.com/blog/p
     - 1D convolution projection from encoder hidden size to vocabulary size (for optimal NeMo compatibility).
     - CTC loss computation for training.
     - Greedy CTC decoding for inference.
+- [**ParakeetForRNNT**](#parakeetforrnnt): a Fast Conformer Encoder + an RNNT decoder
+  - **Prediction Network**: Single-layer LSTM that conditions on previously emitted tokens (blank token mapped to zero embedding via `blank_as_pad`).
+  - **Joint Network**: Projects encoder and prediction states into a shared space, applies activation + dropout, then produces per-frame-per-label logits.
+  - **RNNT Loss**: Pure-PyTorch forward-backward dynamic-programming loss over the T×U lattice.
+  - **Greedy Decoding**: Frame-looping decoder with configurable `max_symbols_per_step`.
+- [**ParakeetForTDT**](#parakeetfortdt): RNNT extension that also predicts a *frame-skip duration* alongside each token
+  - **TDT Loss**: Combined `omega * RNNT_loss + (1−omega) * TDT_loss` over user-defined duration values; sigma under-normalization applied to label logits.
+  - **TDT Greedy Decoding**: Duration-based frame skipping; blank predictions with duration 0 are forced to advance by at least one frame.
 
 The original implementation can be found in [NVIDIA NeMo](https://github.com/NVIDIA/NeMo).
 Model checkpoints are to be found under [the NVIDIA organization](https://huggingface.co/nvidia/models?search=parakeet).
@@ -188,6 +196,87 @@ outputs = model(**inputs)
 outputs.loss.backward()
 ```
 
+### RNNT inference
+
+[`ParakeetForRNNT`] uses a greedy frame-looping decoder. Call `.generate()` to transcribe audio:
+
+```python
+from transformers import ParakeetForRNNT, AutoProcessor
+from datasets import load_dataset, Audio
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = AutoProcessor.from_pretrained("nvidia/parakeet-rnnt-1.1b")
+model = ParakeetForRNNT.from_pretrained("nvidia/parakeet-rnnt-1.1b", dtype="auto", device_map=device)
+
+ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+speech_samples = [el['array'] for el in ds["audio"][:5]]
+
+inputs = processor(speech_samples, sampling_rate=processor.feature_extractor.sampling_rate)
+inputs.to(model.device, dtype=model.dtype)
+
+token_ids = model.generate(**inputs)
+print(processor.batch_decode(token_ids))
+```
+
+### RNNT training
+
+Pass `labels` (token IDs, shape `[B, U]`) and `label_lengths` (shape `[B]`) to compute RNNT loss:
+
+```python
+from transformers import ParakeetForRNNT, AutoProcessor
+from datasets import load_dataset, Audio
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = AutoProcessor.from_pretrained("nvidia/parakeet-rnnt-1.1b")
+model = ParakeetForRNNT.from_pretrained("nvidia/parakeet-rnnt-1.1b", dtype="auto", device_map=device)
+
+ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+speech_samples = [el['array'] for el in ds["audio"][:5]]
+text_samples = ds["text"][:5]
+
+inputs = processor(audio=speech_samples, text=text_samples, sampling_rate=processor.feature_extractor.sampling_rate)
+inputs.to(device, dtype=model.dtype)
+
+outputs = model(
+    input_features=inputs["input_features"],
+    attention_mask=inputs["attention_mask"],
+    labels=inputs["labels"],
+    label_lengths=inputs["label_lengths"],
+)
+outputs.loss.backward()
+```
+
+### TDT inference
+
+[`ParakeetForTDT`] extends RNNT with predicted frame-skip durations. The `.generate()` API is identical:
+
+```python
+from transformers import ParakeetForTDT, AutoProcessor
+from datasets import load_dataset, Audio
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = AutoProcessor.from_pretrained("nvidia/parakeet-tdt-1.1b")
+model = ParakeetForTDT.from_pretrained("nvidia/parakeet-tdt-1.1b", dtype="auto", device_map=device)
+
+ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
+speech_samples = [el['array'] for el in ds["audio"][:5]]
+
+inputs = processor(speech_samples, sampling_rate=processor.feature_extractor.sampling_rate)
+inputs.to(model.device, dtype=model.dtype)
+
+token_ids = model.generate(**inputs)
+print(processor.batch_decode(token_ids))
+```
+
 ## ParakeetTokenizer
 
 [[autodoc]] ParakeetTokenizer
@@ -219,3 +308,31 @@ outputs.loss.backward()
 ## ParakeetForCTC
 
 [[autodoc]] ParakeetForCTC
+
+## ParakeetPredictionNetworkConfig
+
+[[autodoc]] ParakeetPredictionNetworkConfig
+
+## ParakeetJointNetworkConfig
+
+[[autodoc]] ParakeetJointNetworkConfig
+
+## ParakeetRNNTConfig
+
+[[autodoc]] ParakeetRNNTConfig
+
+## ParakeetTDTConfig
+
+[[autodoc]] ParakeetTDTConfig
+
+## ParakeetForRNNT
+
+[[autodoc]] ParakeetForRNNT
+    - forward
+    - generate
+
+## ParakeetForTDT
+
+[[autodoc]] ParakeetForTDT
+    - forward
+    - generate
