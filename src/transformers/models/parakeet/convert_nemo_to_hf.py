@@ -28,7 +28,11 @@ from transformers import (
     ParakeetEncoderConfig,
     ParakeetFeatureExtractor,
     ParakeetForCTC,
+    ParakeetForRNNT,
+    ParakeetForTDT,
     ParakeetProcessor,
+    ParakeetRNNTConfig,
+    ParakeetTDTConfig,
     ParakeetTokenizer,
 )
 from transformers.convert_slow_tokenizer import ParakeetConverter
@@ -46,6 +50,18 @@ NEMO_TO_HF_WEIGHT_MAPPING = {
     r"linear_q": r"q_proj",
     r"pos_bias_([uv])": r"bias_\1",
     r"linear_pos": r"relative_k_proj",
+}
+
+# Additional key mappings for transducer (RNNT / TDT) models.
+# Applied on top of NEMO_TO_HF_WEIGHT_MAPPING when converting RNNT/TDT checkpoints.
+NEMO_TO_HF_RNNT_EXTRA_MAPPING = {
+    r"decoder\.prediction\.embed\.": r"prediction_network.embedding.",
+    r"decoder\.prediction\.dec_rnn\.lstm\.": r"prediction_network.lstm.",
+    r"joint\.enc\.": r"joint_network.enc_proj.",
+    r"joint\.pred\.": r"joint_network.pred_proj.",
+    # joint_net may be Sequential([Linear]) or Sequential([Dropout, Linear]);
+    # only the Linear has parameters so any index works.
+    r"joint\.joint_net\.\d+\.": r"joint_network.out_proj.",
 }
 
 
@@ -257,8 +273,15 @@ def convert_encoder_config(nemo_config):
     return ParakeetEncoderConfig(**converted_encoder_config)
 
 
-def load_and_convert_state_dict(model_files):
-    """Load NeMo state dict and convert keys to HF format."""
+def load_and_convert_state_dict(model_files, extra_mapping=None):
+    """Load NeMo state dict and convert keys to HF format.
+
+    Args:
+        model_files: Dict with path to model weights.
+        extra_mapping: Optional additional regex key-mapping dict merged on top of
+            NEMO_TO_HF_WEIGHT_MAPPING (used for RNNT / TDT models).
+    """
+    mapping = {**NEMO_TO_HF_WEIGHT_MAPPING, **(extra_mapping or {})}
     state_dict = torch.load(model_files["model_weights"], map_location="cpu", weights_only=True)
     converted_state_dict = {}
     for key, value in state_dict.items():
@@ -266,7 +289,7 @@ def load_and_convert_state_dict(model_files):
         if key.endswith("featurizer.window") or key.endswith("featurizer.fb"):
             print(f"Skipping preprocessing weight: {key}")
             continue
-        converted_key = convert_key(key, NEMO_TO_HF_WEIGHT_MAPPING)
+        converted_key = convert_key(key, mapping)
         converted_state_dict[converted_key] = value
 
     return converted_state_dict
@@ -329,20 +352,164 @@ def write_encoder_model(encoder_config, converted_state_dict, output_dir, push_t
     print("Model reloaded successfully.")
 
 
+def _get_prednet(nemo_config):
+    """Return the prediction-network sub-dict, handling flat vs. nested NeMo layouts."""
+    decoder = nemo_config["decoder"]
+    return decoder.get("prednet", decoder)
+
+
+def _get_jointnet(nemo_config):
+    """Return the joint-network sub-dict, handling flat vs. nested NeMo layouts."""
+    joint = nemo_config["joint"]
+    return joint.get("jointnet", joint)
+
+
+def _get_vocab_size(nemo_config):
+    """Infer vocab_size (including blank) from the NeMo config."""
+    # Prefer joint.num_classes (RNNTJoint always stores the full output dim).
+    joint = nemo_config.get("joint", {})
+    if "num_classes" in joint:
+        return joint["num_classes"]
+    # Fall back to top-level model config key.
+    if "vocab_size" in nemo_config:
+        return nemo_config["vocab_size"]
+    raise ValueError(
+        "Cannot determine vocab_size from NeMo config. "
+        "Expected 'joint.num_classes' or top-level 'vocab_size'."
+    )
+
+
+def convert_prediction_network_config(nemo_config):
+    """Convert NeMo RNNT decoder config to a dict suitable for ParakeetPredictionNetworkConfig."""
+    decoder = nemo_config["decoder"]
+    prednet = _get_prednet(nemo_config)
+    return {
+        "pred_hidden": prednet.get("pred_hidden", 640),
+        "pred_rnn_layers": prednet.get("pred_rnn_layers", 1),
+        "dropout": prednet.get("dropout", 0.0),
+        "blank_as_pad": decoder.get("blank_as_pad", True),
+    }
+
+
+def convert_joint_network_config(nemo_config):
+    """Convert NeMo RNNT joint config to a dict suitable for ParakeetJointNetworkConfig."""
+    jointnet = _get_jointnet(nemo_config)
+    return {
+        "joint_hidden": jointnet.get("joint_hidden", 640),
+        "activation": jointnet.get("activation", "relu"),
+        "dropout": jointnet.get("dropout", 0.0),
+    }
+
+
+def convert_rnnt_config(nemo_config, encoder_config):
+    """Build a ParakeetRNNTConfig from NeMo model config + already-converted encoder config."""
+    vocab_size = _get_vocab_size(nemo_config)
+    blank_id = vocab_size - 1  # NeMo convention: blank is the last token
+    pred_cfg = convert_prediction_network_config(nemo_config)
+    joint_cfg = convert_joint_network_config(nemo_config)
+    return ParakeetRNNTConfig(
+        vocab_size=vocab_size,
+        blank_id=blank_id,
+        encoder_config=encoder_config,
+        prediction_network_config=pred_cfg,
+        joint_network_config=joint_cfg,
+    )
+
+
+def convert_tdt_config(nemo_config, encoder_config):
+    """Build a ParakeetTDTConfig from NeMo model config + already-converted encoder config."""
+    vocab_size = _get_vocab_size(nemo_config)
+    blank_id = vocab_size - 1
+    pred_cfg = convert_prediction_network_config(nemo_config)
+    joint_cfg = convert_joint_network_config(nemo_config)
+
+    # TDT-specific parameters live under the loss config in NeMo.
+    loss_cfg = nemo_config.get("loss", {})
+    durations = loss_cfg.get("durations", [0, 1, 2, 3, 4])
+    sigma = loss_cfg.get("sigma", 0.05)
+    omega = loss_cfg.get("omega", 0.1)
+
+    return ParakeetTDTConfig(
+        vocab_size=vocab_size,
+        blank_id=blank_id,
+        encoder_config=encoder_config,
+        prediction_network_config=pred_cfg,
+        joint_network_config=joint_cfg,
+        durations=durations,
+        sigma=sigma,
+        omega=omega,
+    )
+
+
+def write_rnnt_model(rnnt_config, converted_state_dict, output_dir, push_to_repo_id=None):
+    """Write RNNT model using already-converted config and state dict."""
+    print("Loading the checkpoint in a Parakeet RNNT model.")
+    with torch.device("meta"):
+        model = ParakeetForRNNT(rnnt_config)
+    model.load_state_dict(converted_state_dict, strict=True, assign=True)
+    print("Checkpoint loaded successfully.")
+    del model.config._name_or_path
+
+    print("Saving the model.")
+    model.save_pretrained(output_dir)
+
+    if push_to_repo_id:
+        model.push_to_hub(push_to_repo_id)
+    del model
+
+    gc.collect()
+    print("Reloading the model to check if it's saved correctly.")
+    ParakeetForRNNT.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    print("Model reloaded successfully.")
+
+
+def write_tdt_model(tdt_config, converted_state_dict, output_dir, push_to_repo_id=None):
+    """Write TDT model using already-converted config and state dict."""
+    print("Loading the checkpoint in a Parakeet TDT model.")
+    with torch.device("meta"):
+        model = ParakeetForTDT(tdt_config)
+    model.load_state_dict(converted_state_dict, strict=True, assign=True)
+    print("Checkpoint loaded successfully.")
+    del model.config._name_or_path
+
+    print("Saving the model.")
+    model.save_pretrained(output_dir)
+
+    if push_to_repo_id:
+        model.push_to_hub(push_to_repo_id)
+    del model
+
+    gc.collect()
+    print("Reloading the model to check if it's saved correctly.")
+    ParakeetForTDT.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    print("Model reloaded successfully.")
+
+
 def write_model(nemo_config, model_files, model_type, output_dir, push_to_repo_id=None):
     """Main model conversion function."""
     # Step 1: Convert encoder config (shared across all model types)
     encoder_config = convert_encoder_config(nemo_config)
     print(f"Converted encoder config: {encoder_config}")
 
-    # Step 2: Load and convert state dict (shared across all model types)
-    converted_state_dict = load_and_convert_state_dict(model_files)
+    # Step 2: Load and convert state dict (shared across all model types;
+    # RNNT/TDT require the extra transducer key mappings).
+    is_transducer = model_type in ("rnnt", "tdt")
+    extra_mapping = NEMO_TO_HF_RNNT_EXTRA_MAPPING if is_transducer else None
+    converted_state_dict = load_and_convert_state_dict(model_files, extra_mapping=extra_mapping)
 
     # Step 3: Write model based on type
     if model_type == "encoder":
         write_encoder_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id)
     elif model_type == "ctc":
         write_ctc_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id)
+    elif model_type == "rnnt":
+        rnnt_config = convert_rnnt_config(nemo_config, encoder_config)
+        print(f"Converted RNNT config: {rnnt_config}")
+        write_rnnt_model(rnnt_config, converted_state_dict, output_dir, push_to_repo_id)
+    elif model_type == "tdt":
+        tdt_config = convert_tdt_config(nemo_config, encoder_config)
+        print(f"Converted TDT config: {tdt_config}")
+        write_tdt_model(tdt_config, converted_state_dict, output_dir, push_to_repo_id)
     else:
         raise ValueError(f"Model type {model_type} not supported.")
 
@@ -367,7 +534,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_repo_id", required=True, help="Model repo on huggingface.co")
     parser.add_argument(
-        "--model_type", required=True, choices=["encoder", "ctc"], help="Model type (`encoder`, `ctc`)"
+        "--model_type",
+        required=True,
+        choices=["encoder", "ctc", "rnnt", "tdt"],
+        help="Model type (`encoder`, `ctc`, `rnnt`, `tdt`)",
     )
     parser.add_argument("--output_dir", required=True, help="Output directory for HuggingFace model")
     parser.add_argument("--push_to_repo_id", help="Repository ID to push the model to on the Hub")
