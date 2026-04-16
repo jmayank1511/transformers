@@ -37,6 +37,10 @@ if is_torch_available():
         ParakeetEncoder,
         ParakeetEncoderConfig,
         ParakeetForCTC,
+        ParakeetForRNNT,
+        ParakeetForTDT,
+        ParakeetRNNTConfig,
+        ParakeetTDTConfig,
     )
 
 
@@ -373,3 +377,285 @@ class ParakeetForCTCIntegrationTest(unittest.TestCase):
         torch.testing.assert_close(predicted_ids.cpu(), EXPECTED_TOKEN_IDS)
         predicted_transcripts = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
         self.assertListEqual(predicted_transcripts, EXPECTED_TRANSCRIPTIONS)
+
+
+# ---------------------------------------------------------------------------
+# RNNT tests
+# ---------------------------------------------------------------------------
+
+
+class ParakeetForRNNTModelTester:
+    def __init__(
+        self,
+        parent,
+        batch_size=2,
+        seq_length=160,
+        label_seq_length=4,
+        vocab_size=16,
+        pred_hidden=32,
+        joint_hidden=32,
+        encoder_kwargs=None,
+        is_training=True,
+    ):
+        self.parent = parent
+        self.batch_size = batch_size
+        self.input_seq_length = seq_length  # raw mel frames fed to the encoder
+        self.label_seq_length = label_seq_length
+        self.vocab_size = vocab_size
+        self.pred_hidden = pred_hidden
+        self.joint_hidden = joint_hidden
+        self.is_training = is_training
+
+        enc_defaults = dict(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=128,
+            num_mel_bins=80,
+            subsampling_factor=8,
+            subsampling_conv_channels=32,
+            dropout=0.0,
+            dropout_positions=0.0,
+            layerdrop=0.0,
+            activation_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        if encoder_kwargs:
+            enc_defaults.update(encoder_kwargs)
+        self.encoder_kwargs = enc_defaults
+        # attributes used by ModelTesterMixin.test_hidden_states_output
+        self.num_hidden_layers = enc_defaults["num_hidden_layers"]
+        self.hidden_size = enc_defaults["hidden_size"]
+        # encoder output length after subsampling_factor=8
+        self.output_seq_length = seq_length // 8
+        # ModelTesterMixin uses seq_length for shape assertions (post-subsampling)
+        self.seq_length = self.output_seq_length
+
+    def get_config(self):
+        return ParakeetRNNTConfig(
+            vocab_size=self.vocab_size,
+            blank_id=self.vocab_size - 1,
+            encoder_config=self.encoder_kwargs,
+            prediction_network_config={"pred_hidden": self.pred_hidden},
+            joint_network_config={"joint_hidden": self.joint_hidden},
+        )
+
+    def prepare_config_and_inputs(self):
+        input_features = floats_tensor([self.batch_size, self.input_seq_length, 80])
+        attention_mask = random_attention_mask([self.batch_size, self.input_seq_length])
+        labels = ids_tensor([self.batch_size, self.label_seq_length], self.vocab_size - 1)
+        label_lengths = torch.full((self.batch_size,), self.label_seq_length, dtype=torch.long)
+        config = self.get_config()
+        return config, input_features, attention_mask, labels, label_lengths
+
+    def prepare_config_and_inputs_for_common(self):
+        config, input_features, attention_mask, _labels, _ll = self.prepare_config_and_inputs()
+        return config, {"input_features": input_features, "attention_mask": attention_mask}
+
+    def create_and_check_model(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForRNNT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            result = model(input_features, attention_mask=attention_mask)
+        self.parent.assertEqual(
+            result.encoder_last_hidden_state.shape,
+            (self.batch_size, self.output_seq_length, config.encoder_config.hidden_size),
+        )
+
+    def create_and_check_forward_with_labels(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForRNNT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            result = model(
+                input_features,
+                attention_mask=attention_mask,
+                labels=labels,
+                label_lengths=label_lengths,
+            )
+        self.parent.assertIsNotNone(result.loss)
+        self.parent.assertTrue(result.loss.item() > 0)
+
+    def create_and_check_generate(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForRNNT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            sequences = model.generate(input_features, attention_mask=attention_mask)
+        self.parent.assertEqual(sequences.shape[0], self.batch_size)
+
+
+@require_torch
+class ParakeetForRNNTModelTest(ModelTesterMixin, unittest.TestCase):
+    all_model_classes = (ParakeetForRNNT,) if is_torch_available() else ()
+
+    test_resize_embeddings = False
+    test_attention_outputs = False
+    _is_composite = True
+
+    def setUp(self):
+        self.model_tester = ParakeetForRNNTModelTester(self)
+        self.config_tester = ConfigTester(self, config_class=ParakeetRNNTConfig)
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
+
+    def test_model(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_model(*config_and_inputs)
+
+    def test_forward_with_labels(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_forward_with_labels(*config_and_inputs)
+
+    def test_generate(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_generate(*config_and_inputs)
+
+    @unittest.skip(reason="ParakeetForRNNT does not use inputs_embeds")
+    def test_model_get_set_embeddings(self):
+        pass
+
+    @unittest.skip(reason="RNNT training requires label_lengths which is not in the standard inputs_dict")
+    def test_model_outputs_equivalence(self):
+        pass
+
+    def test_sdpa_can_dispatch_composite_models(self):
+        if not self.has_attentions:
+            self.skipTest(reason="Model architecture does not support attentions")
+
+        if not self._is_composite:
+            self.skipTest(f"{self.all_model_classes[0].__name__} does not support SDPA")
+
+        for model_class in self.all_model_classes:
+            config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+            model = model_class(config)
+
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.save_pretrained(tmpdirname)
+                model_eager = model_class.from_pretrained(tmpdirname, attn_implementation="eager")
+                model_eager = model_eager.eval().to(torch_device)
+                self.assertTrue(model_eager.config._attn_implementation == "eager")
+
+
+# ---------------------------------------------------------------------------
+# TDT tests
+# ---------------------------------------------------------------------------
+
+
+class ParakeetForTDTModelTester(ParakeetForRNNTModelTester):
+    def __init__(self, parent, durations=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.durations = durations if durations is not None else [0, 1, 2, 3, 4]
+
+    def get_config(self):
+        return ParakeetTDTConfig(
+            vocab_size=self.vocab_size,
+            blank_id=self.vocab_size - 1,
+            encoder_config=self.encoder_kwargs,
+            prediction_network_config={"pred_hidden": self.pred_hidden},
+            joint_network_config={"joint_hidden": self.joint_hidden},
+            durations=self.durations,
+        )
+
+    def create_and_check_model(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForTDT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            result = model(input_features, attention_mask=attention_mask)
+        self.parent.assertEqual(
+            result.encoder_last_hidden_state.shape,
+            (self.batch_size, self.output_seq_length, config.encoder_config.hidden_size),
+        )
+
+    def create_and_check_forward_with_labels(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForTDT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            result = model(
+                input_features,
+                attention_mask=attention_mask,
+                labels=labels,
+                label_lengths=label_lengths,
+            )
+        self.parent.assertIsNotNone(result.loss)
+        self.parent.assertTrue(result.loss.item() > 0)
+
+    def create_and_check_joint_output_dim(self, config, input_features, attention_mask, labels, label_lengths):
+        """Joint output last dim must be vocab_size + num_durations."""
+        model = ParakeetForTDT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            result = model(input_features, attention_mask=attention_mask, labels=labels,
+                           label_lengths=label_lengths, return_logits=True)
+        expected_last_dim = config.vocab_size + len(config.durations)
+        self.parent.assertEqual(result.logits.shape[-1], expected_last_dim)
+
+    def create_and_check_generate(self, config, input_features, attention_mask, labels, label_lengths):
+        model = ParakeetForTDT(config=config)
+        model.to(torch_device)
+        model.eval()
+        with torch.no_grad():
+            sequences = model.generate(input_features, attention_mask=attention_mask)
+        self.parent.assertEqual(sequences.shape[0], self.batch_size)
+
+
+@require_torch
+class ParakeetForTDTModelTest(ModelTesterMixin, unittest.TestCase):
+    all_model_classes = (ParakeetForTDT,) if is_torch_available() else ()
+
+    test_resize_embeddings = False
+    test_attention_outputs = False
+    _is_composite = True
+
+    def setUp(self):
+        self.model_tester = ParakeetForTDTModelTester(self)
+        self.config_tester = ConfigTester(self, config_class=ParakeetTDTConfig)
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
+
+    def test_model(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_model(*config_and_inputs)
+
+    def test_forward_with_labels(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_forward_with_labels(*config_and_inputs)
+
+    def test_joint_output_dim(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_joint_output_dim(*config_and_inputs)
+
+    def test_generate(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_generate(*config_and_inputs)
+
+    @unittest.skip(reason="ParakeetForTDT does not use inputs_embeds")
+    def test_model_get_set_embeddings(self):
+        pass
+
+    @unittest.skip(reason="TDT training requires label_lengths which is not in the standard inputs_dict")
+    def test_model_outputs_equivalence(self):
+        pass
+
+    def test_sdpa_can_dispatch_composite_models(self):
+        if not self.has_attentions:
+            self.skipTest(reason="Model architecture does not support attentions")
+
+        if not self._is_composite:
+            self.skipTest(f"{self.all_model_classes[0].__name__} does not support SDPA")
+
+        for model_class in self.all_model_classes:
+            config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+            model = model_class(config)
+
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.save_pretrained(tmpdirname)
+                model_eager = model_class.from_pretrained(tmpdirname, attn_implementation="eager")
+                model_eager = model_eager.eval().to(torch_device)
+                self.assertTrue(model_eager.config._attn_implementation == "eager")
