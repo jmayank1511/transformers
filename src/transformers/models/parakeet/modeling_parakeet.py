@@ -509,7 +509,13 @@ class ParakeetPreTrainedModel(PreTrainedModel):
             # 0.02 is the standard default value across the library
             std = getattr(self.config.get_text_config(), "initializer_range", 0.02)
 
-        if isinstance(module, ParakeetEncoderAttention):
+        if isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if "weight" in name:
+                    init.uniform_(param, -std, std)
+                elif "bias" in name:
+                    init.zeros_(param)
+        elif isinstance(module, ParakeetEncoderAttention):
             # Initialize positional bias parameters
             init.normal_(module.bias_u, mean=0.0, std=std)
             init.normal_(module.bias_v, mean=0.0, std=std)
@@ -1297,12 +1303,20 @@ class ParakeetTransducerModelOutput(ModelOutput):
             Encoder output hidden states.
         encoder_attention_mask (`torch.LongTensor` of shape ``[B, T]``, *optional*):
             Encoder output attention mask after subsampling.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*):
+            Encoder hidden-states at the output of each layer, returned when
+            ``output_hidden_states=True`` is passed.
+        attentions (`tuple(torch.FloatTensor)`, *optional*):
+            Encoder self-attention weights, returned when
+            ``output_attentions=True`` is passed.
     """
 
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
     encoder_last_hidden_state: torch.FloatTensor | None = None
     encoder_attention_mask: torch.LongTensor | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
 
 
 @auto_docstring(
@@ -1411,6 +1425,8 @@ class ParakeetForRNNT(ParakeetPreTrainedModel):
             logits=logits,
             encoder_last_hidden_state=encoder_hidden,
             encoder_attention_mask=encoder_outputs.attention_mask,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
         )
 
     def _pred_step(
@@ -1725,6 +1741,8 @@ class ParakeetForTDT(ParakeetForRNNT):
             logits=logits,
             encoder_last_hidden_state=encoder_hidden,
             encoder_attention_mask=encoder_outputs.attention_mask,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
         )
 
     def _greedy_decode(

@@ -55,7 +55,7 @@ NEMO_TO_HF_WEIGHT_MAPPING = {
 # Additional key mappings for transducer (RNNT / TDT) models.
 # Applied on top of NEMO_TO_HF_WEIGHT_MAPPING when converting RNNT/TDT checkpoints.
 NEMO_TO_HF_RNNT_EXTRA_MAPPING = {
-    r"decoder\.prediction\.embed\.": r"prediction_network.embedding.",
+    r"decoder\.prediction\.embed\.": r"prediction_network.embed.",
     r"decoder\.prediction\.dec_rnn\.lstm\.": r"prediction_network.lstm.",
     r"joint\.enc\.": r"joint_network.enc_proj.",
     r"joint\.pred\.": r"joint_network.pred_proj.",
@@ -364,13 +364,18 @@ def _get_jointnet(nemo_config):
     return joint.get("jointnet", joint)
 
 
-def _get_vocab_size(nemo_config):
-    """Infer vocab_size (including blank) from the NeMo config."""
-    # Prefer joint.num_classes (RNNTJoint always stores the full output dim).
+def _get_nemo_vocab_size(nemo_config):
+    """Return the NeMo vocab_size (number of non-blank tokens).
+
+    NeMo stores 'vocab_size' as the count of regular tokens, with the blank
+    token appended afterwards.  The total HF vocab_size = nemo_vocab_size + 1
+    and blank_id = nemo_vocab_size.
+    """
+    # NeMo RNNTJoint.num_classes = number of non-blank tokens (blank appended after).
     joint = nemo_config.get("joint", {})
     if "num_classes" in joint:
         return joint["num_classes"]
-    # Fall back to top-level model config key.
+    # Fall back to the top-level 'vocab_size' key (excludes blank).
     if "vocab_size" in nemo_config:
         return nemo_config["vocab_size"]
     raise ValueError(
@@ -403,8 +408,10 @@ def convert_joint_network_config(nemo_config):
 
 def convert_rnnt_config(nemo_config, encoder_config):
     """Build a ParakeetRNNTConfig from NeMo model config + already-converted encoder config."""
-    vocab_size = _get_vocab_size(nemo_config)
-    blank_id = vocab_size - 1  # NeMo convention: blank is the last token
+    nemo_vocab = _get_nemo_vocab_size(nemo_config)
+    # NeMo appends blank after all regular tokens: blank_id = nemo_vocab_size.
+    blank_id = nemo_vocab
+    vocab_size = nemo_vocab + 1  # total including blank
     pred_cfg = convert_prediction_network_config(nemo_config)
     joint_cfg = convert_joint_network_config(nemo_config)
     return ParakeetRNNTConfig(
@@ -418,8 +425,9 @@ def convert_rnnt_config(nemo_config, encoder_config):
 
 def convert_tdt_config(nemo_config, encoder_config):
     """Build a ParakeetTDTConfig from NeMo model config + already-converted encoder config."""
-    vocab_size = _get_vocab_size(nemo_config)
-    blank_id = vocab_size - 1
+    nemo_vocab = _get_nemo_vocab_size(nemo_config)
+    blank_id = nemo_vocab
+    vocab_size = nemo_vocab + 1
     pred_cfg = convert_prediction_network_config(nemo_config)
     joint_cfg = convert_joint_network_config(nemo_config)
 

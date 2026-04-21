@@ -1,0 +1,58 @@
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Traceback (most recent call last):
+  File "/workspace/transformers/test_rnnt_tdt.py", line 157, in <module>
+    test_rnnt("/tmp/parakeet_hf/rnnt")
+  File "/workspace/transformers/test_rnnt_tdt.py", line 77, in test_rnnt
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 2638, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for ParakeetForRNNT:
+	size mismatch for prediction_network.embed.weight: copying a param with shape torch.Size([1025, 640]) from checkpoint, the shape in current model is torch.Size([1024, 640]).
+	size mismatch for joint_network.out_proj.weight: copying a param with shape torch.Size([1025, 640]) from checkpoint, the shape in current model is torch.Size([1024, 640]).
+	size mismatch for joint_network.out_proj.bias: copying a param with shape torch.Size([1025]) from checkpoint, the shape in current model is torch.Size([1024]).
+Traceback (most recent call last):
+  File "/workspace/transformers/test_rnnt_tdt.py", line 164, in <module>
+    test_tdt("/tmp/parakeet_hf/tdt")
+  File "/workspace/transformers/test_rnnt_tdt.py", line 126, in test_tdt
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 2638, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for ParakeetForTDT:
+	size mismatch for prediction_network.embed.weight: copying a param with shape torch.Size([8193, 640]) from checkpoint, the shape in current model is torch.Size([8192, 640]).
+	size mismatch for joint_network.out_proj.weight: copying a param with shape torch.Size([8198, 640]) from checkpoint, the shape in current model is torch.Size([8197, 640]).
+	size mismatch for joint_network.out_proj.bias: copying a param with shape torch.Size([8198]) from checkpoint, the shape in current model is torch.Size([8197]).
+
+============================================================
+RNNT conversion + inference test
+============================================================
+Extracting parakeet-rnnt-1.1b.nemo ...
+Converting config ...
+  vocab_size=1024, blank_id=1023
+Converting weights ...
+Skipping preprocessing weight: preprocessor.featurizer.window
+Skipping preprocessing weight: preprocessor.featurizer.fb
+  1707 tensors converted
+Loading model (strict=False to see gaps) ...
+RNNT FAILED: Error(s) in loading state_dict for ParakeetForRNNT:
+	size mismatch for prediction_network.embed.weight: copying a param with shape torch.Size([1025, 640]) from checkpoint, the shape in current model is torch.Size([1024, 640]).
+	size mismatch for joint_network.out_proj.weight: copying a param with shape torch.Size([1025, 640]) from checkpoint, the shape in current model is torch.Size([1024, 640]).
+	size mismatch for joint_network.out_proj.bias: copying a param with shape torch.Size([1025]) from checkpoint, the shape in current model is torch.Size([1024]).
+
+============================================================
+TDT conversion + inference test
+============================================================
+Extracting parakeet-tdt-0.6b-v3.nemo ...
+Converting config ...
+  vocab_size=8192, blank_id=8191, durations=[0, 1, 2, 3, 4]
+Converting weights ...
+Skipping preprocessing weight: preprocessor.featurizer.window
+Skipping preprocessing weight: preprocessor.featurizer.fb
+  723 tensors converted
+Loading model (strict=False to see gaps) ...
+TDT FAILED: Error(s) in loading state_dict for ParakeetForTDT:
+	size mismatch for prediction_network.embed.weight: copying a param with shape torch.Size([8193, 640]) from checkpoint, the shape in current model is torch.Size([8192, 640]).
+	size mismatch for joint_network.out_proj.weight: copying a param with shape torch.Size([8198, 640]) from checkpoint, the shape in current model is torch.Size([8197, 640]).
+	size mismatch for joint_network.out_proj.bias: copying a param with shape torch.Size([8198]) from checkpoint, the shape in current model is torch.Size([8197]).
