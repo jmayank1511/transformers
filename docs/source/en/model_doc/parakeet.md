@@ -212,6 +212,14 @@ outputs.loss.backward()
 
 [[autodoc]] ParakeetCTCConfig
 
+## ParakeetEncoderModelOutput
+
+[[autodoc]] models.parakeet.modeling_parakeet.ParakeetEncoderModelOutput
+
+## ParakeetCTCModelOutput
+
+[[autodoc]] models.parakeet.modeling_parakeet.ParakeetCTCModelOutput
+
 ## ParakeetEncoder
 
 [[autodoc]] ParakeetEncoder
