@@ -41,11 +41,41 @@ from .configuration_parakeet import ParakeetCTCConfig, ParakeetEncoderConfig
 @dataclass
 @auto_docstring(
     custom_intro="""
-    Extends [~modeling_outputs.BaseModelOutput] to include the output attention mask since sequence length is not preserved in the model's forward.
+    Extends [~modeling_outputs.BaseModelOutput] to include the output attention mask and optional
+    streaming caches. Caches are only populated for cache-aware models when `use_cache=True`.
     """
 )
 class ParakeetEncoderModelOutput(BaseModelOutput):
     attention_mask: torch.Tensor | None = None
+    cache_last_channel: torch.Tensor | None = None
+    cache_last_time: torch.Tensor | None = None
+    cache_last_channel_len: torch.Tensor | None = None
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Extends [~modeling_outputs.CausalLMOutput] to carry optional streaming cache tensors from
+    the encoder. Caches are only populated for cache-aware models when `use_cache=True`.
+    """
+)
+class ParakeetCTCModelOutput(CausalLMOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        CTC loss.
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language model head.
+    cache_last_channel (`torch.Tensor` of shape `(num_layers, batch, left_ctx, hidden_size)`, *optional*):
+        Updated attention cache from the encoder (sliding KV window). Pass to the next chunk call.
+    cache_last_time (`torch.Tensor` of shape `(num_layers, batch, hidden_size, conv_left_ctx)`, *optional*):
+        Updated convolution cache from the encoder. Pass to the next chunk call.
+    cache_last_channel_len (`torch.Tensor` of shape `(batch,)`, *optional*):
+        Number of valid frames currently stored in `cache_last_channel`.
+    """
+
+    cache_last_channel: torch.Tensor | None = None
+    cache_last_time: torch.Tensor | None = None
+    cache_last_channel_len: torch.Tensor | None = None
 
 
 class ParakeetEncoderRelPositionalEncoding(nn.Module):
@@ -68,8 +98,9 @@ class ParakeetEncoderRelPositionalEncoding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, hidden_states: torch.Tensor):
-        seq_length = hidden_states.shape[1]
+    def forward(self, hidden_states: torch.Tensor, context_length: int | None = None):
+        # context_length overrides hidden_states.shape[1] for streaming (cache + chunk)
+        seq_length = context_length if context_length is not None else hidden_states.shape[1]
         if seq_length > self.max_position_embeddings:
             raise ValueError(
                 f"Sequence Length: {seq_length} has to be less or equal than "
@@ -147,8 +178,42 @@ class ParakeetEncoderConvolutionModule(nn.Module):
         self.pointwise_conv2 = nn.Conv1d(
             channels, channels, kernel_size=1, stride=1, padding=0, bias=config.convolution_bias
         )
+        kernel_size = config.conv_kernel_size
 
-    def forward(self, hidden_states, attention_mask=None):
+        if config.conv_norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(channels)
+
+        # Resolve conv left/right padding
+        conv_ctx = config.conv_context_size
+        if conv_ctx is None:
+            self._conv_left = (kernel_size - 1) // 2
+            self._conv_right = (kernel_size - 1) // 2
+        elif conv_ctx == "causal":
+            self._conv_left = kernel_size - 1
+            self._conv_right = 0
+        else:  # explicit [left, right]
+            self._conv_left, self._conv_right = conv_ctx
+
+        # When padding differs from the symmetric default, replace depthwise conv (padding=0)
+        # and handle padding manually in forward().
+        sym = (kernel_size - 1) // 2
+        if self._conv_left != sym or self._conv_right != sym:
+            self.depthwise_conv = nn.Conv1d(
+                channels,
+                channels,
+                kernel_size,
+                stride=1,
+                padding=0,
+                groups=channels,
+                bias=config.convolution_bias,
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        cache_last_time: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Compute convolution module.
 
@@ -160,29 +225,50 @@ class ParakeetEncoderConvolutionModule(nn.Module):
             `torch.Tensor`: Output tensor of shape `(batch, time, channels)`.
 
         """
-        # exchange the temporal dimension and the feature dimension
-        hidden_states = hidden_states.transpose(1, 2)
+        hidden_states = hidden_states.transpose(1, 2)  # (B, C, T)
 
-        # GLU mechanism, (batch_size, 2*channel, dim)
         hidden_states = self.pointwise_conv1(hidden_states)
-        # (batch_size, channel, dim)
-        hidden_states = nn.functional.glu(hidden_states, dim=1)
+        hidden_states = nn.functional.glu(hidden_states, dim=1)  # (B, C, T)
 
-        # Apply padding mask before convolution
         if attention_mask is not None:
+            # Reduce over key dim (-1) to get per-query padding indicator (B, 1, T_query).
+            # Works for both offline (B,1,T,T) and streaming (B,1,T_q,T_k) masks.
             if attention_mask.dtype == torch.bool:
-                all_masked_rows = torch.all(~attention_mask, dim=2)
+                all_masked = torch.all(~attention_mask, dim=-1)
             else:
-                all_masked_rows = torch.all(~(attention_mask == 0.0), dim=2)
-            hidden_states = hidden_states.masked_fill(all_masked_rows, 0.0)
+                all_masked = torch.all(attention_mask == 0.0, dim=-1)
+            hidden_states = hidden_states.masked_fill(all_masked, 0.0)
 
-        # 1D Depthwise Conv
-        hidden_states = self.depthwise_conv(hidden_states)
-        hidden_states = self.norm(hidden_states)
+        sym = (self.depthwise_conv.kernel_size[0] - 1) // 2
+        if self._conv_left != sym or self._conv_right != sym:
+            # Asymmetric / causal padding with optional cache
+            if cache_last_time is not None:
+                # cache_last_time: (B, C, _conv_left)
+                padded = torch.cat([cache_last_time, hidden_states], dim=2)
+                new_cache = padded[:, :, -self._conv_left :]
+            else:
+                padded = nn.functional.pad(hidden_states, (self._conv_left, 0))
+                new_cache = None
+            if self._conv_right > 0:
+                padded = nn.functional.pad(padded, (0, self._conv_right))
+            hidden_states = self.depthwise_conv(padded)
+        else:
+            # Symmetric padding baked into depthwise_conv (from super().__init__)
+            hidden_states = self.depthwise_conv(hidden_states)
+            new_cache = None
+
+        if isinstance(self.norm, nn.LayerNorm):
+            hidden_states = self.norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        else:
+            hidden_states = self.norm(hidden_states)
+
         hidden_states = self.activation(hidden_states)
         hidden_states = self.pointwise_conv2(hidden_states)
+        hidden_states = hidden_states.transpose(1, 2)  # (B, T, C)
 
-        return hidden_states.transpose(1, 2)
+        if new_cache is not None:
+            return hidden_states, new_cache
+        return hidden_states
 
 
 def rotate_half(x):
@@ -293,8 +379,9 @@ class ParakeetEncoderAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor | None,
         attention_mask: torch.Tensor | None = None,
+        cache_last_channel: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         batch_size, seq_length = input_shape
         hidden_shape = (batch_size, seq_length, -1, self.head_dim)
@@ -302,6 +389,20 @@ class ParakeetEncoderAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # Prepend cached K, V from previous chunks
+        new_cache = None
+        if cache_last_channel is not None:
+            cache_len = cache_last_channel.shape[1]
+            cache_shape = (batch_size, cache_len, -1, self.head_dim)
+            k_cache = self.k_proj(cache_last_channel).view(cache_shape).transpose(1, 2)
+            v_cache = self.v_proj(cache_last_channel).view(cache_shape).transpose(1, 2)
+            key_states = torch.cat([k_cache, key_states], dim=2)
+            value_states = torch.cat([v_cache, value_states], dim=2)
+            # Sliding window update: keep the last cache_len frames of [cache | current]
+            new_cache = torch.cat([cache_last_channel, hidden_states], dim=1)[:, -cache_len:]
+
+        total_key_length = key_states.shape[2]  # cache_len + seq_length (or just seq_length)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -317,10 +418,10 @@ class ParakeetEncoderAttention(nn.Module):
         relative_key_states = self.relative_k_proj(position_embeddings)
         relative_key_states = relative_key_states.view(batch_size, -1, self.config.num_attention_heads, self.head_dim)
 
-        # terms (b) and (d)
+        # terms (b) and (d) — slice to total_key_length to cover cache + current chunk
         matrix_bd = query_states_with_bias_v @ relative_key_states.permute(0, 2, 3, 1)
         matrix_bd = self._rel_shift(matrix_bd)
-        matrix_bd = matrix_bd[..., :seq_length]
+        matrix_bd = matrix_bd[..., :total_key_length]
         matrix_bd = matrix_bd * self.scaling
 
         if attention_mask is not None:
@@ -343,7 +444,7 @@ class ParakeetEncoderAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, new_cache
 
     def _rel_shift(self, attention_scores):
         """Relative position shift for Shaw et al. style attention. See appendix B of https://huggingface.co/papers/1901.02860."""
@@ -361,44 +462,56 @@ class ParakeetEncoderSubsamplingConv2D(nn.Module):
         self.kernel_size = config.subsampling_conv_kernel_size
         self.stride = config.subsampling_conv_stride
         self.channels = config.subsampling_conv_channels
-        self.padding = (self.kernel_size - 1) // 2
         self.num_layers = int(math.log2(config.subsampling_factor))
+        self.causal = config.causal_downsampling
 
-        # define layers
+        if self.causal:
+            # NeMo CausalConv2D pads BOTH freq and time with (kernel_size-1, stride-1).
+            self._causal_left = self.kernel_size - 1  # left pad per dimension
+            self._causal_right = self.stride - 1  # right pad per dimension
+            conv_padding = 0
+        else:
+            conv_padding = (self.kernel_size - 1) // 2
+
         self.layers = nn.ModuleList()
         self.layers.append(
-            nn.Conv2d(1, self.channels, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+            nn.Conv2d(1, self.channels, kernel_size=self.kernel_size, stride=self.stride, padding=conv_padding)
         )
         self.layers.append(nn.ReLU())
-        for i in range(self.num_layers - 1):
-            # depthwise conv
+        for _ in range(self.num_layers - 1):
             self.layers.append(
                 nn.Conv2d(
                     self.channels,
                     self.channels,
                     kernel_size=self.kernel_size,
                     stride=self.stride,
-                    padding=self.padding,
+                    padding=conv_padding,
                     groups=self.channels,
                 )
             )
-            # pointwise conv
             self.layers.append(nn.Conv2d(self.channels, self.channels, kernel_size=1))
-            # activation
             self.layers.append(nn.ReLU())
 
-        out_length = config.num_mel_bins // (self.stride**self.num_layers)
-        self.linear = nn.Linear(config.subsampling_conv_channels * out_length, config.hidden_size, bias=True)
+        # Compute the freq output dimension after all strided convolutions.
+        freq = config.num_mel_bins
+        for _ in range(self.num_layers):
+            if self.causal:
+                # total freq pad = (k-1) + (stride-1) = k + stride - 2
+                freq = (freq + self._causal_left + self._causal_right - self.kernel_size) // self.stride + 1
+            else:
+                freq = (freq + 2 * conv_padding - self.kernel_size) // self.stride + 1
+        self.linear = nn.Linear(config.subsampling_conv_channels * freq, config.hidden_size, bias=True)
 
     def _get_output_length(self, input_lengths: torch.Tensor, conv_layer: nn.Conv2d):
         if hasattr(conv_layer, "stride") and conv_layer.stride != (1, 1):
-            padding = conv_layer.padding
             kernel_size = conv_layer.kernel_size[0]
             stride = conv_layer.stride[0]
-
-            output_lengths = (input_lengths + padding[0] + padding[1] - kernel_size) // stride + 1
-            return output_lengths
-
+            if self.causal:
+                # (k-1) left + (stride-1) right applied manually in forward()
+                total_pad = self._causal_left + self._causal_right
+            else:
+                total_pad = conv_layer.padding[1] * 2  # symmetric time padding
+            return (input_lengths + total_pad - kernel_size) // stride + 1
         return input_lengths
 
     def forward(self, input_features: torch.Tensor, attention_mask: torch.Tensor = None):
@@ -406,16 +519,19 @@ class ParakeetEncoderSubsamplingConv2D(nn.Module):
         current_lengths = attention_mask.sum(-1) if attention_mask is not None else None
 
         for layer in self.layers:
+            if self.causal and isinstance(layer, nn.Conv2d) and layer.kernel_size != (1, 1):
+                # Pad BOTH freq (dim=-2) and time (dim=-1) with (k-1, stride-1), matching NeMo CausalConv2D.
+                hidden_states = nn.functional.pad(
+                    hidden_states,
+                    (self._causal_left, self._causal_right, self._causal_left, self._causal_right),
+                )
             hidden_states = layer(hidden_states)
 
-            # mask the hidden states
-            if isinstance(layer, nn.Conv2d) and attention_mask is not None:
+            if isinstance(layer, nn.Conv2d) and attention_mask is not None and layer.stride != (1, 1):
                 current_lengths = self._get_output_length(current_lengths, layer)
-                current_seq_length = hidden_states.shape[2]
-                channel_mask = (
-                    torch.arange(current_seq_length, device=attention_mask.device) < current_lengths[:, None]
-                )
-                hidden_states *= channel_mask[:, None, :, None]
+                time_out = hidden_states.shape[2]  # (B, C, T_sub, mel_sub) — dim2 is time
+                time_mask = torch.arange(time_out, device=attention_mask.device) < current_lengths[:, None]
+                hidden_states *= time_mask[:, None, :, None]  # (B, 1, T_sub, 1) broadcast over (B, C, T_sub, mel_sub)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(hidden_states.shape[0], hidden_states.shape[2], -1)
         hidden_states = self.linear(hidden_states)
@@ -444,22 +560,31 @@ class ParakeetEncoderBlock(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_embeddings: torch.Tensor | None = None,
+        cache_last_channel: torch.Tensor | None = None,
+        cache_last_time: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         residual = hidden_states
         hidden_states = self.feed_forward1(self.norm_feed_forward1(hidden_states))
         hidden_states = residual + 0.5 * hidden_states  # the conformer architecture uses a factor of 0.5
 
         normalized_hidden_states = self.norm_self_att(hidden_states)
-        attn_output, _ = self.self_attn(
+        attn_output, _, new_cache_channel = self.self_attn(
             hidden_states=normalized_hidden_states,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            cache_last_channel=cache_last_channel,
             **kwargs,
         )
         hidden_states = hidden_states + attn_output
 
-        conv_output = self.conv(self.norm_conv(hidden_states), attention_mask=attention_mask)
+        conv_result = self.conv(
+            self.norm_conv(hidden_states), attention_mask=attention_mask, cache_last_time=cache_last_time
+        )
+        if isinstance(conv_result, tuple):
+            conv_output, new_cache_time = conv_result
+        else:
+            conv_output, new_cache_time = conv_result, None
         hidden_states = hidden_states + conv_output
 
         ff2_output = self.feed_forward2(self.norm_feed_forward2(hidden_states))
@@ -467,7 +592,7 @@ class ParakeetEncoderBlock(GradientCheckpointingLayer):
 
         hidden_states = self.norm_out(hidden_states)
 
-        return hidden_states
+        return hidden_states, new_cache_channel, new_cache_time
 
 
 @auto_docstring
@@ -519,7 +644,11 @@ class ParakeetPreTrainedModel(PreTrainedModel):
         stride = encoder_config.subsampling_conv_stride
         num_layers = int(math.log2(encoder_config.subsampling_factor))
 
-        all_paddings = (kernel_size - 1) // 2 * 2
+        if encoder_config.causal_downsampling:
+            # NeMo CausalConv2D: left_pad=(k-1), right_pad=(stride-1) → total_pad = k+stride-2
+            all_paddings = kernel_size - 1 + stride - 1
+        else:
+            all_paddings = (kernel_size - 1) // 2 * 2
         add_pad = all_paddings - kernel_size
         lengths = input_lengths
 
@@ -569,6 +698,88 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
 
         self.post_init()
 
+    def _resolve_att_context_size(self, att_context_size: list | None) -> list | None:
+        """
+        Resolve the effective [left, right] attention context for this forward pass.
+
+        - If the model is offline (config.att_context_size is None) → returns None.
+        - If att_context_size is provided by the caller → validates and uses it.
+        - Otherwise → uses the first entry from config (the inference default).
+        """
+        configured = self.config.att_context_size
+        if configured is None:
+            return None  # offline model
+
+        if att_context_size is not None:
+            # Validate against trained contexts when multi-lookahead
+            if isinstance(configured[0], list) and att_context_size not in configured:
+                raise ValueError(
+                    f"att_context_size {att_context_size} was not used during training. Trained contexts: {configured}"
+                )
+            return att_context_size
+
+        # Default: first entry
+        if isinstance(configured[0], list):
+            return configured[0]
+        return configured
+
+    def get_initial_cache_state(
+        self,
+        batch_size: int = 1,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Returns zeroed cache tensors to start a streaming session.
+
+        Returns a dict with keys `cache_last_channel`, `cache_last_time`, `cache_last_channel_len`
+        that can be passed directly as `**cache` to `forward()`.
+        """
+        ctx = self._resolve_att_context_size(None)
+        if ctx is None:
+            raise ValueError("get_initial_cache_state() is only valid for cache-aware (streaming) models.")
+
+        left_ctx = ctx[0]
+        conv_ctx = self.config.conv_context_size
+        if conv_ctx is None:
+            conv_left = (self.config.conv_kernel_size - 1) // 2
+        elif conv_ctx == "causal":
+            conv_left = self.config.conv_kernel_size - 1
+        else:
+            conv_left = conv_ctx[0]
+
+        n = self.config.num_hidden_layers
+        d = self.config.hidden_size
+        return {
+            "cache_last_channel": torch.zeros(n, batch_size, left_ctx, d, dtype=dtype, device=device),
+            "cache_last_time": torch.zeros(n, batch_size, d, conv_left, dtype=dtype, device=device),
+            "cache_last_channel_len": torch.zeros(batch_size, dtype=torch.long, device=device),
+        }
+
+    def _build_att_window_mask(
+        self,
+        seq_len: int,
+        total_key_len: int,
+        left_ctx: int,
+        right_ctx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Build a boolean attention window mask of shape (1, 1, seq_len, total_key_len).
+        True = attend, False = mask out.  Limits attention to [left_ctx, right_ctx] window.
+        """
+        # q positions: seq_len-1 .. 0 (newest .. oldest within chunk)
+        # k positions: 0 .. total_key_len-1 (oldest .. newest, cache first then chunk)
+        cache_len = total_key_len - seq_len
+        q_idx = torch.arange(seq_len, device=device).unsqueeze(1)  # (seq_len, 1)
+        k_idx = torch.arange(total_key_len, device=device).unsqueeze(0)  # (1, total_key_len)
+        # absolute positions: cache frames are at positions -(cache_len)..(-1), chunk at 0..(seq_len-1)
+        q_pos = q_idx
+        k_pos = k_idx - cache_len
+        dist = q_pos - k_pos  # positive = left of q, negative = right of q
+        mask = (dist >= -right_ctx) & (dist <= left_ctx)
+        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, total_key_len)
+
     @auto_docstring
     @merge_with_config_defaults
     @capture_outputs
@@ -578,11 +789,28 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
         input_features: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         output_attention_mask: bool = True,
+        cache_last_channel: torch.Tensor | None = None,
+        cache_last_time: torch.Tensor | None = None,
+        cache_last_channel_len: torch.Tensor | None = None,
+        att_context_size: list | None = None,
+        use_cache: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutput:
         r"""
         output_attention_mask (`bool`, *optional*, defaults to `True`):
             Whether to return the output attention mask. Only effective when `attention_mask` is provided.
+        cache_last_channel (`torch.Tensor` of shape `(num_layers, batch, left_ctx, hidden_size)`, *optional*):
+            Cached hidden states from previous chunks for the attention layers. Obtained from a prior
+            call's `cache_last_channel` output or from `get_initial_cache_state()`.
+        cache_last_time (`torch.Tensor` of shape `(num_layers, batch, hidden_size, conv_left_ctx)`, *optional*):
+            Cached frames from previous chunks for the causal convolution layers.
+        cache_last_channel_len (`torch.Tensor` of shape `(batch,)`, *optional*):
+            Number of valid frames currently stored in `cache_last_channel`.
+        att_context_size (`list[int]`, *optional*):
+            Override the attention context `[left, right]` for this call. Must be one of the contexts
+            the model was trained with. If not provided, the first entry of `config.att_context_size` is used.
+        use_cache (`bool`, *optional*, defaults to `False`):
+            Whether to return updated cache tensors in the output.
 
         Example:
 
@@ -603,41 +831,91 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
         >>> print(encoder_outputs.last_hidden_state.shape)
         ```
         """
+        effective_ctx = self._resolve_att_context_size(att_context_size)
+        streaming = cache_last_channel is not None or (effective_ctx is not None and use_cache)
 
         hidden_states = self.subsampling(input_features, attention_mask)
         hidden_states = hidden_states * self.input_scale
-        position_embeddings = self.encode_positions(hidden_states)
+
+        # For streaming: generate position embeddings over the full context window (cache + chunk)
+        cache_len = cache_last_channel.shape[2] if cache_last_channel is not None else 0
+        chunk_len = hidden_states.shape[1]
+        total_context_len = chunk_len + cache_len
+        position_embeddings = self.encode_positions(hidden_states, context_length=total_context_len)
 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         position_embeddings = nn.functional.dropout(
             position_embeddings, p=self.dropout_positions, training=self.training
         )
 
+        output_mask = None
         if attention_mask is not None:
-            output_mask = self._get_output_attention_mask(attention_mask, target_length=hidden_states.shape[1])
-            attention_mask = output_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
-            attention_mask = attention_mask & attention_mask.transpose(1, 2)
-            attention_mask = attention_mask.unsqueeze(1)
+            output_mask = self._get_output_attention_mask(attention_mask, target_length=chunk_len)
+            # Build (B, 1, chunk_len, total_context_len) padding mask.
+            # Cache positions are always valid keys; chunk positions are valid if output_mask is True.
+            if cache_len > 0:
+                cache_key_mask = torch.ones(
+                    output_mask.shape[0], cache_len, dtype=torch.bool, device=output_mask.device
+                )
+                full_key_mask = torch.cat([cache_key_mask, output_mask], dim=1)  # (B, total_context_len)
+            else:
+                full_key_mask = output_mask  # (B, chunk_len)
+            # (B, chunk_len, 1) & (B, 1, total_key_len) → (B, chunk_len, total_key_len)
+            pad_mask = output_mask.unsqueeze(2) & full_key_mask.unsqueeze(1)
+            attention_mask_4d = pad_mask.unsqueeze(1)  # (B, 1, chunk_len, total_key_len)
+        else:
+            attention_mask_4d = None
 
-        for encoder_layer in self.layers:
-            # add LayerDrop (see https://huggingface.co/papers/1909.11556 for description)
+        # Attention window mask for streaming/cache-aware models
+        if effective_ctx is not None:
+            left_ctx, right_ctx = effective_ctx
+            window_mask = self._build_att_window_mask(
+                chunk_len, total_context_len, left_ctx, right_ctx, hidden_states.device
+            )
+            if attention_mask_4d is not None:
+                attention_mask_4d = attention_mask_4d & window_mask
+            else:
+                attention_mask_4d = window_mask
+
+        new_cache_channels: list[torch.Tensor] = []
+        new_cache_times: list[torch.Tensor] = []
+
+        for i, encoder_layer in enumerate(self.layers):
             to_drop = False
             if self.training:
                 dropout_probability = torch.rand([])
-                if dropout_probability < self.layerdrop:  # skip the layer
+                if dropout_probability < self.layerdrop:
                     to_drop = True
 
             if not to_drop:
-                hidden_states = encoder_layer(
+                layer_cache_ch = cache_last_channel[i] if cache_last_channel is not None else None
+                layer_cache_time = cache_last_time[i] if cache_last_time is not None else None
+                hidden_states, new_ch, new_time = encoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=attention_mask_4d,
                     position_embeddings=position_embeddings,
+                    cache_last_channel=layer_cache_ch,
+                    cache_last_time=layer_cache_time,
                     **kwargs,
                 )
+                if streaming:
+                    new_cache_channels.append(new_ch if new_ch is not None else layer_cache_ch)
+                    new_cache_times.append(new_time if new_time is not None else layer_cache_time)
+
+        out_cache_channel, out_cache_time, out_cache_len = None, None, None
+        if streaming and use_cache and new_cache_channels:
+            out_cache_channel = torch.stack(new_cache_channels, dim=0)
+            out_cache_time = torch.stack(new_cache_times, dim=0)
+            if cache_last_channel_len is not None:
+                left_ctx = effective_ctx[0] if effective_ctx else 0
+                out_cache_len = torch.clamp(cache_last_channel_len + chunk_len, max=left_ctx)
 
         return ParakeetEncoderModelOutput(
             last_hidden_state=hidden_states,
-            attention_mask=output_mask.int() if attention_mask is not None and output_attention_mask else None,
+            attention_mask=output_mask.int() if output_mask is not None and output_attention_mask else None,
+            cache_last_channel=out_cache_channel,
+            cache_last_time=out_cache_time,
+            cache_last_channel_len=out_cache_len,
         )
 
 
@@ -691,9 +969,30 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
         input_features: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        cache_last_channel: torch.Tensor | None = None,
+        cache_last_time: torch.Tensor | None = None,
+        cache_last_channel_len: torch.Tensor | None = None,
+        att_context_size: list | None = None,
+        use_cache: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutput:
+    ) -> ParakeetCTCModelOutput:
         r"""
+        labels (`torch.LongTensor` of shape `(batch_size, target_length)`, *optional*):
+            Labels for connectionist temporal classification. Note that `target_length` has to be smaller or equal to
+            the sequence length of the output logits. Indices are selected in `[-100, 0, ..., config.vocab_size - 1]`.
+            All labels set to `-100` are ignored (masked), the loss is only computed for labels in `[0, ...,
+            config.vocab_size - 1]`.
+        cache_last_channel (`torch.Tensor` of shape `(num_layers, batch, left_ctx, hidden_size)`, *optional*):
+            Cached encoder hidden states from previous chunks. See `ParakeetEncoder.get_initial_cache_state()`.
+        cache_last_time (`torch.Tensor` of shape `(num_layers, batch, hidden_size, conv_left_ctx)`, *optional*):
+            Cached frames for the causal convolution layers.
+        cache_last_channel_len (`torch.Tensor` of shape `(batch,)`, *optional*):
+            Number of valid frames in `cache_last_channel`.
+        att_context_size (`list[int]`, *optional*):
+            Override `[left, right]` attention context for this call. Defaults to first trained context.
+        use_cache (`bool`, *optional*, defaults to `False`):
+            Whether to return updated cache tensors.
+
         Example:
 
         ```python
@@ -716,6 +1015,11 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
         encoder_outputs = self.encoder(
             input_features=input_features,
             attention_mask=attention_mask,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+            att_context_size=att_context_size,
+            use_cache=use_cache,
             **kwargs,
         )
 
@@ -750,11 +1054,14 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
                     zero_infinity=self.config.ctc_zero_infinity,
                 )
 
-        return CausalLMOutput(
+        return ParakeetCTCModelOutput(
             loss=loss,
             logits=logits,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+            cache_last_channel=getattr(encoder_outputs, "cache_last_channel", None),
+            cache_last_time=getattr(encoder_outputs, "cache_last_time", None),
+            cache_last_channel_len=getattr(encoder_outputs, "cache_last_channel_len", None),
         )
 
     @torch.no_grad()
@@ -812,4 +1119,10 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
         return sequences
 
 
-__all__ = ["ParakeetForCTC", "ParakeetEncoder", "ParakeetPreTrainedModel"]
+__all__ = [
+    "ParakeetCTCModelOutput",
+    "ParakeetEncoderModelOutput",
+    "ParakeetForCTC",
+    "ParakeetEncoder",
+    "ParakeetPreTrainedModel",
+]

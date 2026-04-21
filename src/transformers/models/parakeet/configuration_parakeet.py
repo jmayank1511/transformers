@@ -41,6 +41,24 @@ class ParakeetEncoderConfig(PreTrainedConfig):
         The dropout ratio for the positions in the input sequence.
     scale_input (`bool`, *optional*, defaults to `True`):
         Whether to scale the input embeddings.
+    att_context_size (`list[int]` or `list[list[int]]`, *optional*, defaults to `None`):
+        Attention context window `[left, right]`. `None` means full (offline) context. A single pair
+        `[70, 13]` sets one streaming context. A list of pairs `[[70, 13], [70, 0]]` enables
+        multi-lookahead training; the first entry is used as the inference default.
+    att_context_probs (`list[float]`, *optional*, defaults to `None`):
+        Sampling probabilities for each entry in `att_context_size` during training (multi-lookahead).
+        Only used when `att_context_size` is a list of pairs. Unused at inference.
+    att_context_style (`str`, *optional*, defaults to `"regular"`):
+        Attention context style: `"regular"` or `"chunked_limited"`.
+    conv_context_size (`str` or `list[int]`, *optional*, defaults to `None`):
+        Convolution context window. `None` applies symmetric `[(k-1)//2, (k-1)//2]` padding.
+        `"causal"` applies left-only `[k-1, 0]` padding. A list `[left, right]` (where
+        `left + right + 1 == conv_kernel_size`) applies custom asymmetric padding.
+    causal_downsampling (`bool`, *optional*, defaults to `False`):
+        Whether the subsampling convolution layers use causal (left-only) padding in the time dimension.
+    conv_norm_type (`str`, *optional*, defaults to `"batch_norm"`):
+        Normalization type for the depthwise convolution in the Conformer block: `"batch_norm"` or
+        `"layer_norm"`.
 
     Example:
         ```python
@@ -84,9 +102,27 @@ class ParakeetEncoderConfig(PreTrainedConfig):
     max_position_embeddings: int = 5000
     scale_input: bool = True
     initializer_range: float = 0.02
+    att_context_size: list | None = None
+    att_context_probs: list | None = None
+    att_context_style: str = "regular"
+    conv_context_size: str | list | None = None
+    causal_downsampling: bool = False
+    conv_norm_type: str = "batch_norm"
 
     def __post_init__(self, **kwargs):
         self.num_key_value_heads = self.num_attention_heads
+        if self.att_context_size is not None:
+            # normalise to list-of-pairs internally
+            if isinstance(self.att_context_size[0], int):
+                # single pair [l, r] — keep as-is
+                pass
+            # list of pairs [[l,r], ...] — also fine
+        if isinstance(self.conv_context_size, list):
+            left, right = self.conv_context_size
+            if left + right + 1 != self.conv_kernel_size:
+                raise ValueError(
+                    f"conv_context_size {self.conv_context_size} must satisfy left+right+1 == conv_kernel_size ({self.conv_kernel_size})."
+                )
         super().__post_init__(**kwargs)
 
 
