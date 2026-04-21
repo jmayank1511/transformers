@@ -35,17 +35,31 @@ from transformers.convert_slow_tokenizer import ParakeetConverter
 from transformers.utils.hub import cached_file
 
 
-NEMO_TO_HF_WEIGHT_MAPPING = {
+NEMO_TO_HF_ENCODER_MAPPING = {
     r"encoder\.pre_encode\.conv\.": r"encoder.subsampling.layers.",
     r"encoder\.pre_encode\.out\.": r"encoder.subsampling.linear.",
     r"encoder\.pos_enc\.": r"encoder.encode_positions.",
     r"encoder\.layers\.(\d+)\.conv\.batch_norm\.": r"encoder.layers.\1.conv.norm.",
-    r"decoder\.decoder_layers\.0\.(weight|bias)": r"ctc_head.\1",
+    r"encoder\.layers\.(\d+)\.conv\.layer_norm\.": r"encoder.layers.\1.conv.norm.",
     r"linear_([kv])": r"\1_proj",
     r"linear_out": r"o_proj",
     r"linear_q": r"q_proj",
     r"pos_bias_([uv])": r"bias_\1",
     r"linear_pos": r"relative_k_proj",
+}
+
+# CTC head key prefix differs between pure-CTC and hybrid models
+NEMO_CTC_KEY_PREFIX = {
+    "ctc": r"decoder\.decoder_layers\.0\.(weight|bias)",
+    "hybrid_rnnt_ctc": r"ctc_decoder\.decoder_layers\.0\.(weight|bias)",
+}
+
+# Keys to skip when converting to a given HF model type
+NEMO_SKIP_PREFIXES = {
+    "ctc": [],
+    "encoder": [],
+    "rnnt": ["decoder.", "joint.", "preprocessor."],
+    "hybrid_rnnt_ctc": ["decoder.", "joint.", "preprocessor."],  # skip RNNT decoder/joint
 }
 
 
@@ -164,7 +178,10 @@ def write_processor(nemo_config: dict, model_files, output_dir, push_to_repo_id=
         }
     )
 
-    feature_extractor_keys_to_ignore = ["_target_", "pad_to", "frame_splicing", "dither", "normalize", "window", "log"]
+    feature_extractor_keys_to_ignore = [
+        "_target_", "pad_to", "frame_splicing", "dither", "window", "log",
+        "nb_augmentation_prob",  # training-only augmentation flag
+    ]
     feature_extractor_config_keys_mapping = {
         "sample_rate": "sampling_rate",
         "window_size": "win_length",
@@ -179,6 +196,7 @@ def write_processor(nemo_config: dict, model_files, output_dir, push_to_repo_id=
         "frame_splicing": "frame_splicing",
         "preemphasis": "preemphasis",
         "hop_length": "hop_length",
+        "normalize": "do_normalize",
     }
     converted_feature_extractor_config = {}
 
@@ -188,6 +206,9 @@ def write_processor(nemo_config: dict, model_files, output_dir, push_to_repo_id=
         if key in feature_extractor_config_keys_mapping:
             if key in ["window_size", "window_stride"]:
                 value = int(value * nemo_config["preprocessor"]["sample_rate"])
+            elif key == "normalize":
+                # NeMo "NA" means no normalization; anything else (e.g. "per_feature") means normalize
+                value = value != "NA"
             converted_feature_extractor_config[feature_extractor_config_keys_mapping[key]] = value
         else:
             raise ValueError(f"Key {key} not found in feature_extractor_keys_mapping")
@@ -204,27 +225,35 @@ def write_processor(nemo_config: dict, model_files, output_dir, push_to_repo_id=
         processor.push_to_hub(push_to_repo_id)
 
 
+def detect_nemo_model_type(nemo_config: dict) -> str:
+    """Detect NeMo model class from _target_ and return one of: 'ctc', 'rnnt', 'hybrid_rnnt_ctc'."""
+    target = nemo_config.get("_target_", nemo_config.get("target", ""))
+    if "EncDecHybridRNNTCTC" in target:
+        return "hybrid_rnnt_ctc"
+    if "RNNT" in target or "Transducer" in target:
+        return "rnnt"
+    if "CTC" in target:
+        return "ctc"
+    raise ValueError(f"Cannot determine NeMo model type from _target_: '{target}'")
+
+
 def convert_encoder_config(nemo_config):
     """Convert NeMo encoder config to HF encoder config."""
     encoder_keys_to_ignore = [
-        "att_context_size",
-        "causal_downsampling",
         "stochastic_depth_start_layer",
         "feat_out",
         "stochastic_depth_drop_prob",
         "_target_",
         "ff_expansion_factor",
         "untie_biases",
-        "att_context_style",
         "self_attention_model",
-        "conv_norm_type",
         "subsampling",
         "stochastic_depth_mode",
-        "conv_context_size",
         "dropout_pre_encoder",
         "reduction",
         "reduction_factor",
         "reduction_position",
+        "att_context_probs",  # training-only; stored as-is if present
     ]
     encoder_config_keys_mapping = {
         "d_model": "hidden_size",
@@ -240,6 +269,12 @@ def convert_encoder_config(nemo_config):
         "dropout_att": "attention_dropout",
         "xscaling": "scale_input",
         "use_bias": "attention_bias",
+        # streaming fields
+        "att_context_size": "att_context_size",
+        "att_context_style": "att_context_style",
+        "conv_context_size": "conv_context_size",
+        "causal_downsampling": "causal_downsampling",
+        "conv_norm_type": "conv_norm_type",
     }
     converted_encoder_config = {}
 
@@ -254,19 +289,51 @@ def convert_encoder_config(nemo_config):
         else:
             raise ValueError(f"Key {key} not found in encoder_config_keys_mapping")
 
+    # Compute intermediate_size from ff_expansion_factor × d_model
+    nemo_enc = nemo_config["encoder"]
+    if "ff_expansion_factor" in nemo_enc:
+        converted_encoder_config["intermediate_size"] = (
+            nemo_enc["ff_expansion_factor"] * nemo_enc["d_model"]
+        )
+
+    # Normalise offline att_context_size: [-1, -1] → None
+    ctx = converted_encoder_config.get("att_context_size")
+    if ctx is not None:
+        is_offline = ctx == [-1, -1] or (isinstance(ctx[0], list) and all(c == [-1, -1] for c in ctx))
+        if is_offline:
+            converted_encoder_config.pop("att_context_size")
+
     return ParakeetEncoderConfig(**converted_encoder_config)
 
 
-def load_and_convert_state_dict(model_files):
-    """Load NeMo state dict and convert keys to HF format."""
+def load_and_convert_state_dict(model_files, nemo_model_type: str, hf_model_type: str):
+    """Load NeMo state dict and convert keys to HF format.
+
+    Args:
+        nemo_model_type: detected NeMo architecture ('ctc', 'rnnt', 'hybrid_rnnt_ctc').
+        hf_model_type: target HF model type ('ctc', 'encoder').
+    """
     state_dict = torch.load(model_files["model_weights"], map_location="cpu", weights_only=True)
+
+    # Build the CTC head mapping based on where the CTC head lives in this checkpoint
+    ctc_pattern = NEMO_CTC_KEY_PREFIX.get(nemo_model_type, NEMO_CTC_KEY_PREFIX["ctc"])
+    weight_mapping = dict(NEMO_TO_HF_ENCODER_MAPPING)
+    weight_mapping[ctc_pattern] = r"ctc_head.\1"
+
+    # Prefixes to skip for the requested hf_model_type
+    skip_prefixes = tuple(NEMO_SKIP_PREFIXES.get(hf_model_type, []))
+    # Always skip featurizer
+    skip_suffixes = ("featurizer.window", "featurizer.fb")
+
     converted_state_dict = {}
     for key, value in state_dict.items():
-        # Skip preprocessing weights (featurizer components)
-        if key.endswith("featurizer.window") or key.endswith("featurizer.fb"):
+        if any(key.endswith(s) for s in skip_suffixes):
             print(f"Skipping preprocessing weight: {key}")
             continue
-        converted_key = convert_key(key, NEMO_TO_HF_WEIGHT_MAPPING)
+        if skip_prefixes and key.startswith(skip_prefixes):
+            print(f"Skipping decoder weight (not needed for {hf_model_type}): {key}")
+            continue
+        converted_key = convert_key(key, weight_mapping)
         converted_state_dict[converted_key] = value
 
     return converted_state_dict
@@ -274,7 +341,10 @@ def load_and_convert_state_dict(model_files):
 
 def write_ctc_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id=None):
     """Write CTC model using encoder config and converted state dict."""
-    model_config = ParakeetCTCConfig.from_encoder_config(encoder_config)
+    # Infer vocab_size from the CTC head weight shape
+    ctc_weight_key = next(k for k in converted_state_dict if "ctc_head" in k and "weight" in k)
+    vocab_size = converted_state_dict[ctc_weight_key].shape[0]
+    model_config = ParakeetCTCConfig(encoder_config=encoder_config, vocab_size=vocab_size)
 
     print("Loading the checkpoint in a Parakeet CTC model.")
     with torch.device("meta"):
@@ -294,7 +364,10 @@ def write_ctc_model(encoder_config, converted_state_dict, output_dir, push_to_re
     # Safety check: reload the converted model
     gc.collect()
     print("Reloading the model to check if it's saved correctly.")
-    ParakeetForCTC.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    try:
+        ParakeetForCTC.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    except ValueError:
+        ParakeetForCTC.from_pretrained(output_dir, dtype=torch.bfloat16)
     print("Model reloaded successfully.")
 
 
@@ -325,26 +398,31 @@ def write_encoder_model(encoder_config, converted_state_dict, output_dir, push_t
     # Safety check: reload the converted model
     gc.collect()
     print("Reloading the model to check if it's saved correctly.")
-    ParakeetEncoder.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    try:
+        ParakeetEncoder.from_pretrained(output_dir, dtype=torch.bfloat16, device_map="auto")
+    except ValueError:
+        ParakeetEncoder.from_pretrained(output_dir, dtype=torch.bfloat16)
     print("Model reloaded successfully.")
 
 
 def write_model(nemo_config, model_files, model_type, output_dir, push_to_repo_id=None):
     """Main model conversion function."""
-    # Step 1: Convert encoder config (shared across all model types)
+    nemo_model_type = detect_nemo_model_type(nemo_config)
+    print(f"Detected NeMo model type: {nemo_model_type}")
+
     encoder_config = convert_encoder_config(nemo_config)
     print(f"Converted encoder config: {encoder_config}")
 
-    # Step 2: Load and convert state dict (shared across all model types)
-    converted_state_dict = load_and_convert_state_dict(model_files)
+    converted_state_dict = load_and_convert_state_dict(model_files, nemo_model_type, model_type)
 
-    # Step 3: Write model based on type
     if model_type == "encoder":
         write_encoder_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id)
     elif model_type == "ctc":
+        if nemo_model_type == "rnnt":
+            raise ValueError("The checkpoint has no CTC decoder (pure RNNT). Use --model_type encoder.")
         write_ctc_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id)
     else:
-        raise ValueError(f"Model type {model_type} not supported.")
+        raise ValueError(f"Model type '{model_type}' not supported. Choose from: encoder, ctc.")
 
 
 def main(
