@@ -38,6 +38,7 @@ if is_torch_available():
         ParakeetEncoderConfig,
         ParakeetForCTC,
     )
+    from transformers.models.parakeet.modeling_parakeet import ParakeetCTCModelOutput
 
 
 class ParakeetEncoderModelTester:
@@ -373,3 +374,287 @@ class ParakeetForCTCIntegrationTest(unittest.TestCase):
         torch.testing.assert_close(predicted_ids.cpu(), EXPECTED_TOKEN_IDS)
         predicted_transcripts = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
         self.assertListEqual(predicted_transcripts, EXPECTED_TRANSCRIPTIONS)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streaming / cache-aware tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_streaming_encoder_config(
+    att_context_size=None,
+    att_context_probs=None,
+    conv_context_size="causal",
+    causal_downsampling=True,
+    num_hidden_layers=2,
+    hidden_size=64,
+    num_attention_heads=4,
+    intermediate_size=256,
+    conv_kernel_size=9,
+    subsampling_factor=8,
+    subsampling_conv_channels=32,
+    num_mel_bins=80,
+):
+    """Return a small ParakeetEncoderConfig with streaming parameters."""
+    if att_context_size is None:
+        att_context_size = [8, 4]
+    return ParakeetEncoderConfig(
+        hidden_size=hidden_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        intermediate_size=intermediate_size,
+        hidden_act="silu",
+        dropout=0.0,
+        dropout_positions=0.0,
+        layerdrop=0.0,
+        activation_dropout=0.0,
+        attention_dropout=0.0,
+        conv_kernel_size=conv_kernel_size,
+        subsampling_factor=subsampling_factor,
+        subsampling_conv_channels=subsampling_conv_channels,
+        num_mel_bins=num_mel_bins,
+        att_context_size=att_context_size,
+        att_context_probs=att_context_probs,
+        conv_context_size=conv_context_size,
+        causal_downsampling=causal_downsampling,
+    )
+
+
+@require_torch
+class ParakeetStreamingTest(unittest.TestCase):
+    """Tests for the cache-aware (streaming) forward path of ParakeetEncoder."""
+
+    BATCH = 2
+    SEQ = 128  # input frames (before subsampling)
+    MEL = 80
+    N_LAYERS = 2
+    HIDDEN = 64
+    LEFT_CTX = 8  # att_context_size[0]
+    CONV_LEFT = 8  # conv_kernel_size - 1 (causal: 9-1=8)
+    # Causal conv (k=3, s=2) applies floor(L/2)+1 per layer for 3 layers:
+    # 128 → 65 → 33 → 17
+    OUTPUT_T = 17
+
+    def _make_model(self, config=None):
+        if config is None:
+            config = _make_streaming_encoder_config()
+        model = ParakeetEncoder(config=config)
+        model.to(torch_device)
+        model.eval()
+        return model
+
+    def _make_input(self, seq=None, batch=None):
+        B = batch or self.BATCH
+        T = seq or self.SEQ
+        feats = floats_tensor([B, T, self.MEL]).to(torch_device)
+        mask = torch.ones(B, T, dtype=torch.long, device=torch_device)
+        return feats, mask
+
+    # ── get_initial_cache_state ────────────────────────────────────────────────
+
+    def test_get_initial_cache_state_shapes(self):
+        model = self._make_model()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        self.assertEqual(
+            tuple(cache["cache_last_channel"].shape),
+            (self.N_LAYERS, self.BATCH, self.LEFT_CTX, self.HIDDEN),
+        )
+        self.assertEqual(
+            tuple(cache["cache_last_time"].shape),
+            (self.N_LAYERS, self.BATCH, self.HIDDEN, self.CONV_LEFT),
+        )
+        self.assertEqual(tuple(cache["cache_last_channel_len"].shape), (self.BATCH,))
+        self.assertTrue(cache["cache_last_channel"].eq(0).all())
+        self.assertTrue(cache["cache_last_time"].eq(0).all())
+
+    def test_get_initial_cache_state_raises_on_offline_model(self):
+        offline_config = ParakeetEncoderConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=256,
+            num_mel_bins=self.MEL,
+        )
+        model = ParakeetEncoder(config=offline_config).eval()
+        with self.assertRaises(ValueError):
+            model.get_initial_cache_state(batch_size=1)
+
+    # ── use_cache flag ─────────────────────────────────────────────────────────
+
+    def test_use_cache_returns_updated_caches(self):
+        model = self._make_model()
+        feats, mask = self._make_input()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        with torch.no_grad():
+            out = model(feats, attention_mask=mask, use_cache=True, **cache)
+
+        self.assertIsNotNone(out.cache_last_channel)
+        self.assertIsNotNone(out.cache_last_time)
+
+    def test_use_cache_false_returns_no_caches(self):
+        model = self._make_model()
+        feats, mask = self._make_input()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        with torch.no_grad():
+            out = model(feats, attention_mask=mask, use_cache=False, **cache)
+
+        self.assertIsNone(out.cache_last_channel)
+        self.assertIsNone(out.cache_last_time)
+
+    # ── cache shape invariance across two consecutive chunks ──────────────────
+
+    def test_cache_shapes_preserved_across_chunks(self):
+        model = self._make_model()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+        expected_ch_shape = tuple(cache["cache_last_channel"].shape)
+        expected_t_shape = tuple(cache["cache_last_time"].shape)
+
+        with torch.no_grad():
+            out1 = model(*self._make_input(), use_cache=True, **cache)
+            cache2 = {
+                "cache_last_channel": out1.cache_last_channel,
+                "cache_last_time": out1.cache_last_time,
+                "cache_last_channel_len": out1.cache_last_channel_len,
+            }
+            out2 = model(*self._make_input(), use_cache=True, **cache2)
+
+        self.assertEqual(tuple(out1.cache_last_channel.shape), expected_ch_shape)
+        self.assertEqual(tuple(out1.cache_last_time.shape), expected_t_shape)
+        self.assertEqual(tuple(out2.cache_last_channel.shape), expected_ch_shape)
+        self.assertEqual(tuple(out2.cache_last_time.shape), expected_t_shape)
+
+    def test_cache_channel_len_increments_and_clamps(self):
+        """cache_last_channel_len grows per chunk and is capped at left_ctx."""
+        model = self._make_model()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        with torch.no_grad():
+            out1 = model(*self._make_input(), use_cache=True, **cache)
+
+        expected_len = min(self.OUTPUT_T, self.LEFT_CTX)
+        self.assertTrue((out1.cache_last_channel_len == expected_len).all())
+
+        cache2 = {
+            "cache_last_channel": out1.cache_last_channel,
+            "cache_last_time": out1.cache_last_time,
+            "cache_last_channel_len": out1.cache_last_channel_len,
+        }
+        with torch.no_grad():
+            out2 = model(*self._make_input(), use_cache=True, **cache2)
+        self.assertTrue((out2.cache_last_channel_len <= self.LEFT_CTX).all())
+
+    def test_streaming_output_shape_matches_offline(self):
+        """Hidden state shape is identical between streaming and offline paths."""
+        model = self._make_model()
+        feats, mask = self._make_input()
+        cache = model.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        with torch.no_grad():
+            offline_out = model(feats, attention_mask=mask)
+            streaming_out = model(feats, attention_mask=mask, use_cache=True, **cache)
+
+        self.assertEqual(offline_out.last_hidden_state.shape, streaming_out.last_hidden_state.shape)
+
+    # ── attention window mask ──────────────────────────────────────────────────
+
+    def test_build_att_window_mask_shape(self):
+        model = self._make_model()
+        chunk_len, cache_len = 16, 8
+        mask = model._build_att_window_mask(
+            seq_len=chunk_len,
+            total_key_len=chunk_len + cache_len,
+            left_ctx=self.LEFT_CTX,
+            right_ctx=4,
+            device=torch_device,
+        )
+        self.assertEqual(tuple(mask.shape), (1, 1, chunk_len, chunk_len + cache_len))
+        self.assertEqual(mask.dtype, torch.bool)
+
+    def test_build_att_window_mask_correctness(self):
+        """Every (q, k) entry must match the window formula dist ∈ [-right, left]."""
+        model = self._make_model()
+        left_ctx, right_ctx = 2, 1
+        seq_len, cache_len = 4, 2
+        total = seq_len + cache_len
+        mask = model._build_att_window_mask(seq_len, total, left_ctx, right_ctx, device=torch_device)
+
+        for q in range(seq_len):
+            for k in range(total):
+                k_pos = k - cache_len
+                dist = q - k_pos
+                expected = (-right_ctx <= dist) and (dist <= left_ctx)
+                self.assertEqual(
+                    mask[0, 0, q, k].item(),
+                    expected,
+                    msg=f"mask[{q},{k}] wrong (dist={dist}, expected={expected})",
+                )
+
+    # ── multi-lookahead context selection ─────────────────────────────────────
+
+    def test_multi_lookahead_uses_first_context_by_default(self):
+        ctx_list = [[8, 4], [8, 0]]
+        config = _make_streaming_encoder_config(att_context_size=ctx_list, att_context_probs=[0.5, 0.5])
+        model = self._make_model(config)
+        self.assertEqual(model._resolve_att_context_size(None), ctx_list[0])
+
+    def test_multi_lookahead_valid_override(self):
+        ctx_list = [[8, 4], [8, 0]]
+        config = _make_streaming_encoder_config(att_context_size=ctx_list, att_context_probs=[0.5, 0.5])
+        model = self._make_model(config)
+        self.assertEqual(model._resolve_att_context_size([8, 0]), [8, 0])
+
+    def test_multi_lookahead_invalid_override_raises(self):
+        ctx_list = [[8, 4], [8, 0]]
+        config = _make_streaming_encoder_config(att_context_size=ctx_list, att_context_probs=[0.5, 0.5])
+        model = self._make_model(config)
+        with self.assertRaises(ValueError):
+            model._resolve_att_context_size([99, 99])
+
+    def test_offline_model_returns_none_context(self):
+        offline_config = ParakeetEncoderConfig(
+            hidden_size=64, num_hidden_layers=2, num_attention_heads=4, intermediate_size=256, num_mel_bins=self.MEL
+        )
+        model = ParakeetEncoder(config=offline_config).eval()
+        self.assertIsNone(model._resolve_att_context_size(None))
+
+    def test_single_pair_context_resolved(self):
+        config = _make_streaming_encoder_config(att_context_size=[8, 4])
+        model = self._make_model(config)
+        self.assertEqual(model._resolve_att_context_size(None), [8, 4])
+
+    # ── ParakeetForCTC streaming ───────────────────────────────────────────────
+
+    def test_ctc_use_cache_returns_caches(self):
+        enc_config = _make_streaming_encoder_config()
+        ctc_config = ParakeetCTCConfig(encoder_config=enc_config, vocab_size=64)
+        model = ParakeetForCTC(config=ctc_config).to(torch_device).eval()
+
+        feats, mask = self._make_input()
+        cache = model.encoder.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+
+        with torch.no_grad():
+            out = model(feats, attention_mask=mask, use_cache=True, **cache)
+
+        self.assertIsInstance(out, ParakeetCTCModelOutput)
+        self.assertIsNotNone(out.cache_last_channel)
+        self.assertIsNotNone(out.cache_last_time)
+        self.assertEqual(out.logits.shape, (self.BATCH, self.OUTPUT_T, 64))
+
+    def test_ctc_cache_shapes_preserved(self):
+        enc_config = _make_streaming_encoder_config()
+        ctc_config = ParakeetCTCConfig(encoder_config=enc_config, vocab_size=64)
+        model = ParakeetForCTC(config=ctc_config).to(torch_device).eval()
+
+        feats, mask = self._make_input()
+        cache = model.encoder.get_initial_cache_state(batch_size=self.BATCH, device=torch_device)
+        expected_ch_shape = tuple(cache["cache_last_channel"].shape)
+        expected_t_shape = tuple(cache["cache_last_time"].shape)
+
+        with torch.no_grad():
+            out = model(feats, attention_mask=mask, use_cache=True, **cache)
+
+        self.assertEqual(tuple(out.cache_last_channel.shape), expected_ch_shape)
+        self.assertEqual(tuple(out.cache_last_time.shape), expected_t_shape)
