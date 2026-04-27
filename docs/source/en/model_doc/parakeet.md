@@ -83,31 +83,22 @@ print(processor.batch_decode(outputs))
 
 ### Cache-aware streaming
 
-Cache-aware Parakeet models process audio in chunks using a sliding-window attention context, making them suitable for real-time streaming ASR. These models have `att_context_size` set in their config (e.g. `[[70, 13], [70, 6], [70, 1], [70, 0]]`).
+Cache-aware Parakeet models are trained with a sliding-window attention context, making them suitable for real-time streaming ASR. These models have `att_context_size` set in their config (e.g. `[[70, 13], [70, 6], [70, 1], [70, 0]]`).
 
-**One-shot inference** works exactly like the offline models — the model automatically uses the first (largest lookahead) context from the config:
+Usage is identical to offline models. By default, the first (largest lookahead) context from the config is used automatically:
+
+<hfoptions id="streaming-usage">
+<hfoption id="Pipeline">
 
 ```python
-from transformers import AutoModelForCTC, AutoProcessor
-import torch
-
-processor = AutoProcessor.from_pretrained("nvidia/parakeet-ctc-streaming")
-model = AutoModelForCTC.from_pretrained("nvidia/parakeet-ctc-streaming")
-model.eval()
-
-# pipeline() also works out of the box
 from transformers import pipeline
+
 pipe = pipeline("automatic-speech-recognition", model="nvidia/parakeet-ctc-streaming")
 print(pipe("audio.wav"))
 ```
 
-To use a different trained context size, pass `att_context_size` explicitly:
-
-```python
-outputs = model.generate(**inputs, att_context_size=[70, 0])  # causal / zero lookahead
-```
-
-**Chunk-by-chunk streaming** uses `get_initial_cache_state()` and passes the cache forward between chunks:
+</hfoption>
+<hfoption id="AutoModel">
 
 ```python
 from transformers import AutoModelForCTC, AutoProcessor
@@ -116,31 +107,20 @@ import torch
 processor = AutoProcessor.from_pretrained("nvidia/parakeet-ctc-streaming")
 model = AutoModelForCTC.from_pretrained("nvidia/parakeet-ctc-streaming")
 model.eval()
-encoder = model.encoder
 
-# Initialise cache for batch size 1
-cache = encoder.get_initial_cache_state(batch_size=1)
+inputs = processor([audio], return_tensors="pt")
+with torch.no_grad():
+    predicted_ids = model.generate(**inputs)
+print(processor.batch_decode(predicted_ids, skip_special_tokens=True))
+```
 
-for chunk_audio in your_audio_chunks:          # list of numpy arrays, each ~1–2 s
-    inputs = processor([chunk_audio], return_tensors="pt")
-    with torch.no_grad():
-        enc_out = encoder(
-            **inputs,
-            use_cache=True,
-            cache_last_channel=cache["cache_last_channel"],
-            cache_last_time=cache["cache_last_time"],
-            cache_last_channel_len=cache["cache_last_channel_len"],
-        )
-    # update cache for the next chunk
-    cache = {
-        "cache_last_channel":     enc_out.cache_last_channel,
-        "cache_last_time":        enc_out.cache_last_time,
-        "cache_last_channel_len": enc_out.cache_last_channel_len,
-    }
-    # decode this chunk
-    logits = model.ctc_head(enc_out.last_hidden_state.transpose(1, 2)).transpose(1, 2)
-    ids = logits.argmax(-1)
-    print(processor.batch_decode(ids, skip_special_tokens=True))
+</hfoption>
+</hfoptions>
+
+To use a different trained context size (e.g. zero lookahead for lowest latency), pass `att_context_size` explicitly:
+
+```python
+predicted_ids = model.generate(**inputs, att_context_size=[70, 0])
 ```
 
 ### Making The Model Go Brrr

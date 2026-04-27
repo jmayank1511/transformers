@@ -659,6 +659,7 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
         cache_last_channel_len: torch.Tensor | None = None,
         att_context_size: list | None = None,
         use_cache: bool = False,
+        drop_extra_pre_encoded: int = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutput:
         r"""
@@ -676,6 +677,13 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
             the model was trained with. If not provided, the first entry of `config.att_context_size` is used.
         use_cache (`bool`, *optional*, defaults to `False`):
             Whether to return updated cache tensors in the output.
+        drop_extra_pre_encoded (`int`, *optional*, defaults to `0`):
+            Number of encoder frames to drop from the start of the subsampled output before the conformer
+            layers. Used in cache-aware streaming to discard the pre-encode cache frames that were prepended
+            to a chunk (for subsampling Conv2d context) so that only the new chunk frames flow through the
+            conformer and into the KV cache. Equivalent to NeMo's `drop_extra_pre_encoded` parameter.
+            Pass `0` for the first chunk (no pre-encode cache) and `1 + (pre_encode_cache_mel - 1) //
+            subsampling_factor` for subsequent chunks.
 
         Example:
 
@@ -702,6 +710,13 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
         hidden_states = self.subsampling(input_features, attention_mask)
         hidden_states = hidden_states * self.input_scale
 
+        # Drop pre-encode cache frames before conformer layers (NeMo: drop_extra_pre_encoded).
+        # In streaming, each chunk is prepended with a few mel frames of past audio so the
+        # subsampling Conv2d has left context. After subsampling, those extra frames are removed
+        # here so only the genuine new chunk frames pass through the conformer and enter the KV cache.
+        if drop_extra_pre_encoded > 0:
+            hidden_states = hidden_states[:, drop_extra_pre_encoded:, :]
+
         # For streaming: generate position embeddings over the full context window (cache + chunk)
         cache_len = cache_last_channel.shape[2] if cache_last_channel is not None else 0
         chunk_len = hidden_states.shape[1]
@@ -715,7 +730,14 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
 
         output_mask = None
         if attention_mask is not None:
-            output_mask = self._get_output_attention_mask(attention_mask, target_length=chunk_len)
+            if drop_extra_pre_encoded > 0:
+                # attention_mask covers the full extended input (cache mel + chunk mel).
+                # Re-derive valid encoder-frame counts after the drop.
+                subsampled_lengths = self._get_subsampling_output_length(attention_mask.sum(-1))
+                adjusted_lengths = (subsampled_lengths - drop_extra_pre_encoded).clamp(min=0)
+                output_mask = torch.arange(chunk_len, device=attention_mask.device) < adjusted_lengths[:, None]
+            else:
+                output_mask = self._get_output_attention_mask(attention_mask, target_length=chunk_len)
             # Build (B, 1, chunk_len, total_context_len) padding mask.
             # Cache positions are always valid keys; chunk positions are valid if output_mask is True.
             if cache_len > 0:
