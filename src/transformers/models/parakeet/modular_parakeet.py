@@ -741,9 +741,18 @@ class ParakeetEncoder(ParakeetPreTrainedModel):
             # Build (B, 1, chunk_len, total_context_len) padding mask.
             # Cache positions are always valid keys; chunk positions are valid if output_mask is True.
             if cache_len > 0:
-                cache_key_mask = torch.ones(
-                    output_mask.shape[0], cache_len, dtype=torch.bool, device=output_mask.device
-                )
+                if cache_last_channel_len is not None:
+                    # The cache buffer is a fixed-size sliding window; only the last
+                    # cache_last_channel_len entries are valid — mask out the leading zeros.
+                    valid_start = cache_len - cache_last_channel_len  # (B,)
+                    cache_key_mask = (
+                        torch.arange(cache_len, device=output_mask.device).unsqueeze(0)
+                        >= valid_start.unsqueeze(1)
+                    )  # (B, cache_len)
+                else:
+                    cache_key_mask = torch.ones(
+                        output_mask.shape[0], cache_len, dtype=torch.bool, device=output_mask.device
+                    )
                 full_key_mask = torch.cat([cache_key_mask, output_mask], dim=1)  # (B, total_context_len)
             else:
                 full_key_mask = output_mask  # (B, chunk_len)
