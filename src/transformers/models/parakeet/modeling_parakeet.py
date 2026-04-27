@@ -1150,9 +1150,148 @@ class ParakeetForCTC(ParakeetPreTrainedModel):
         return sequences
 
 
+class ParakeetCacheAwareStreamingBuffer:
+    """
+    Streaming audio buffer for cache-aware Parakeet CTC models.
+
+    Splits audio into correctly-sized chunks and yields processor inputs ready to pass
+    directly to the encoder, handling the pre-encode cache, STFT lookahead, and mel
+    frame trimming internally.
+
+    Args:
+        model ([`ParakeetForCTC`]):
+            The streaming CTC model.
+        processor ([`ParakeetProcessor`]):
+            Matching processor (provides the feature extractor and tokenizer).
+        att_context_size (`list[int]`, *optional*):
+            `[left, right]` attention context to use. Defaults to the first (largest
+            lookahead) entry in `model.encoder.config.att_context_size`.
+
+    Example:
+
+    ```python
+    import torch
+    import soundfile as sf
+    from transformers import AutoProcessor, ParakeetForCTC, ParakeetCacheAwareStreamingBuffer
+
+    processor = AutoProcessor.from_pretrained("nvidia/parakeet-ctc-streaming")
+    model = ParakeetForCTC.from_pretrained("nvidia/parakeet-ctc-streaming")
+    model.eval()
+
+    audio, _ = sf.read("audio.wav", dtype="float32")  # resample to 16 kHz if needed
+
+    buffer = ParakeetCacheAwareStreamingBuffer(model, processor)
+    buffer.append_audio(audio)
+
+    cache = model.encoder.get_initial_cache_state(batch_size=1)
+    accumulated_ids = None
+
+    for inputs, drop in buffer:
+        with torch.no_grad():
+            enc_out = model.encoder(
+                **inputs,
+                use_cache=True,
+                att_context_size=buffer.att_context_size,
+                drop_extra_pre_encoded=drop,
+                **cache,
+            )
+            logits = model.ctc_head(enc_out.last_hidden_state.transpose(1, 2)).transpose(1, 2)
+        cache = {
+            "cache_last_channel":     enc_out.cache_last_channel,
+            "cache_last_time":        enc_out.cache_last_time,
+            "cache_last_channel_len": enc_out.cache_last_channel_len,
+        }
+        chunk_ids = logits.argmax(-1).squeeze(0)
+        accumulated_ids = (
+            chunk_ids if accumulated_ids is None else torch.cat([accumulated_ids, chunk_ids])
+        )
+
+    text = processor.batch_decode(accumulated_ids.unsqueeze(0), skip_special_tokens=True)[0]
+    print(text)
+    ```
+    """
+
+    def __init__(self, model: "ParakeetForCTC", processor, att_context_size=None):
+        import numpy as np
+
+        self._np = np
+        encoder = model.encoder
+
+        cfg_ctx = encoder.config.att_context_size
+        if att_context_size is not None:
+            ctx = list(att_context_size)
+        elif isinstance(cfg_ctx[0], list):
+            ctx = list(cfg_ctx[0])
+        else:
+            ctx = list(cfg_ctx)
+        self.att_context_size = ctx
+        R = ctx[1]
+
+        hop = processor.feature_extractor.hop_length
+        S = encoder.config.subsampling_factor
+
+        self._processor = processor
+        self._sr = processor.feature_extractor.sampling_rate
+        self._n_fft_half = processor.feature_extractor.n_fft // 2
+
+        pre_encode_cache_mel = S + 1
+        self._pre_cache_samples = pre_encode_cache_mel * hop
+        self._drop = 1 + (pre_encode_cache_mel - 1) // S
+        self._first_chunk_mel = 1 + S * R
+        self._first_chunk_samples = self._first_chunk_mel * hop
+        self._chunk_mel = S * (R + 1)
+        self._chunk_samples = self._chunk_mel * hop
+        self._target_mel_len = pre_encode_cache_mel + self._chunk_mel
+
+        self._audio = None
+        self._chunks = None
+
+    def append_audio(self, audio):
+        """
+        Queue audio for streaming.
+
+        Args:
+            audio (`numpy.ndarray`):
+                Float32 audio array sampled at `processor.feature_extractor.sampling_rate`.
+        """
+        self._audio = audio
+        self._chunks = [audio[: self._first_chunk_samples]]
+        rem = audio[self._first_chunk_samples :]
+        i = 0
+        while i < len(rem):
+            self._chunks.append(rem[i : i + self._chunk_samples])
+            i += self._chunk_samples
+
+    def __iter__(self):
+        """Yield `(processor_inputs, drop_extra_pre_encoded)` for each chunk."""
+        if self._chunks is None:
+            return
+        np = self._np
+        past = np.zeros(self._pre_cache_samples, dtype=np.float32)
+        for idx, chunk in enumerate(self._chunks):
+            if idx == 0:
+                inputs = self._processor([chunk], return_tensors="pt", sampling_rate=self._sr)
+                if inputs["input_features"].shape[1] > self._first_chunk_mel:
+                    inputs["input_features"] = inputs["input_features"][:, : self._first_chunk_mel, :]
+                    inputs["attention_mask"] = inputs["attention_mask"][:, : self._first_chunk_mel]
+                drop = 0
+            else:
+                ns = self._first_chunk_samples + idx * self._chunk_samples
+                lookahead = self._audio[ns : ns + self._n_fft_half]
+                ext = np.concatenate([past, chunk, lookahead])
+                inputs = self._processor([ext], return_tensors="pt", sampling_rate=self._sr)
+                if inputs["input_features"].shape[1] > self._target_mel_len:
+                    inputs["input_features"] = inputs["input_features"][:, : self._target_mel_len, :]
+                    inputs["attention_mask"] = inputs["attention_mask"][:, : self._target_mel_len]
+                drop = self._drop
+            past = chunk[-self._pre_cache_samples :]
+            yield inputs, drop
+
+
 __all__ = [
     "ParakeetCTCModelOutput",
     "ParakeetEncoderModelOutput",
+    "ParakeetCacheAwareStreamingBuffer",
     "ParakeetForCTC",
     "ParakeetEncoder",
     "ParakeetPreTrainedModel",

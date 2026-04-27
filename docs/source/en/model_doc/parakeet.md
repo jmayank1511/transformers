@@ -87,135 +87,56 @@ Cache-aware Parakeet models are purpose-built for real-time streaming ASR. They 
 
 #### Chunk-by-chunk streaming inference
 
-The encoder processes audio one chunk at a time. A KV cache carries state between chunks so the model never re-processes past audio. CTC token IDs are accumulated across chunks and decoded at the end (or at any step for partial results).
+The encoder processes audio one chunk at a time. A KV cache carries state between chunks so the model never re-processes past audio. [`ParakeetCacheAwareStreamingBuffer`] handles all chunk sizing, pre-encode cache padding, and STFT lookahead internally — just load audio, iterate, and accumulate CTC token IDs.
 
 ```python
-import numpy as np
 import torch
-from transformers import AutoProcessor, ParakeetForCTC
+import soundfile as sf
+from transformers import AutoProcessor, ParakeetForCTC, ParakeetCacheAwareStreamingBuffer
 
 processor = AutoProcessor.from_pretrained("nvidia/parakeet-ctc-streaming")
 model = ParakeetForCTC.from_pretrained("nvidia/parakeet-ctc-streaming")
 model.eval()
-encoder = model.encoder
 
-# --- Derive chunk parameters from model config ---
-hop = processor.feature_extractor.hop_length          # samples per mel frame (160)
-n_fft_half = processor.feature_extractor.n_fft // 2  # lookahead samples for STFT edge (256)
-S = encoder.config.subsampling_factor                 # 8
+audio, _ = sf.read("audio.wav", dtype="float32")  # resample to 16 kHz if needed
 
-# Choose a context size; default is the first (largest lookahead) entry
-ctx = encoder.config.att_context_size
-if isinstance(ctx[0], list):
-    ctx = ctx[0]   # e.g. [70, 6]
-R = ctx[1]         # right context in encoder frames
+buffer = ParakeetCacheAwareStreamingBuffer(model, processor)
+buffer.append_audio(audio)
 
-# Pre-encode cache: a few mel frames prepended to each subsequent chunk so
-# the subsampling Conv2d has proper left context.
-pre_encode_cache_mel  = S + 1                              # 9 mel frames
-pre_cache_samples     = pre_encode_cache_mel * hop         # 1440 audio samples
-drop_extra_pre_encoded = 1 + (pre_encode_cache_mel - 1) // S  # encoder frames to drop after subsampling
-
-# Chunk sizes in mel frames / audio samples
-first_chunk_mel     = 1 + S * R                            # e.g. 49 for R=6
-first_chunk_samples = first_chunk_mel * hop
-chunk_mel           = S * (R + 1)                          # e.g. 56 for R=6
-chunk_samples       = chunk_mel * hop
-target_mel_len      = pre_encode_cache_mel + chunk_mel     # e.g. 65
-
-# --- Split audio into chunks ---
-# `audio` is a float32 numpy array at processor.feature_extractor.sampling_rate
-audio = ...   # load your audio here
-
-chunks = [audio[:first_chunk_samples]]
-remaining = audio[first_chunk_samples:]
-i = 0
-while i < len(remaining):
-    chunks.append(remaining[i : i + chunk_samples])
-    i += chunk_samples
-
-# --- Stream chunk by chunk ---
-cache      = encoder.get_initial_cache_state(batch_size=1)
-past_audio = np.zeros(pre_cache_samples, dtype=np.float32)
+cache = model.encoder.get_initial_cache_state(batch_size=1)
 accumulated_ids = None
 
-for chunk_idx, chunk in enumerate(chunks):
-    is_first = chunk_idx == 0
-
-    if is_first:
-        # No pre-encode cache on the first chunk. STFT center=True can add one
-        # extra mel frame — trim to exactly first_chunk_mel.
-        inputs = processor([chunk], return_tensors="pt")
-        if inputs["input_features"].shape[1] > first_chunk_mel:
-            inputs["input_features"] = inputs["input_features"][:, :first_chunk_mel, :]
-            inputs["attention_mask"] = inputs["attention_mask"][:, :first_chunk_mel]
-        drop = 0
-    else:
-        # Prepend past audio for Conv2d left context. Append a few samples from
-        # the next chunk so the last mel frame is computed from real audio rather
-        # than zero-padding, then trim the result to exactly target_mel_len.
-        next_start = first_chunk_samples + chunk_idx * chunk_samples
-        lookahead  = audio[next_start : next_start + n_fft_half]
-        extended   = np.concatenate([past_audio, chunk, lookahead])
-        inputs = processor([extended], return_tensors="pt")
-        if inputs["input_features"].shape[1] > target_mel_len:
-            inputs["input_features"] = inputs["input_features"][:, :target_mel_len, :]
-            inputs["attention_mask"] = inputs["attention_mask"][:, :target_mel_len]
-        drop = drop_extra_pre_encoded
-
+for inputs, drop in buffer:
     with torch.no_grad():
-        enc_out = encoder(
+        enc_out = model.encoder(
             **inputs,
             use_cache=True,
-            att_context_size=ctx,
-            cache_last_channel=cache["cache_last_channel"],
-            cache_last_time=cache["cache_last_time"],
-            cache_last_channel_len=cache["cache_last_channel_len"],
+            att_context_size=buffer.att_context_size,
             drop_extra_pre_encoded=drop,
+            **cache,
         )
-        logits = model.ctc_head(
-            enc_out.last_hidden_state.transpose(1, 2)
-        ).transpose(1, 2)
-
-    past_audio = chunk[-pre_cache_samples:]
+        logits = model.ctc_head(enc_out.last_hidden_state.transpose(1, 2)).transpose(1, 2)
     cache = {
         "cache_last_channel":     enc_out.cache_last_channel,
         "cache_last_time":        enc_out.cache_last_time,
         "cache_last_channel_len": enc_out.cache_last_channel_len,
     }
-
-    # Accumulate raw argmax IDs; CTC-decode the full sequence at each step.
-    # Concatenating across chunks lets CTC naturally collapse tokens that
-    # span a chunk boundary without duplicates.
     chunk_ids = logits.argmax(-1).squeeze(0)
     accumulated_ids = (
-        chunk_ids if accumulated_ids is None
-        else torch.cat([accumulated_ids, chunk_ids])
+        chunk_ids if accumulated_ids is None else torch.cat([accumulated_ids, chunk_ids])
     )
 
-    # Partial result after this chunk (optional):
-    partial = processor.batch_decode(
-        accumulated_ids.unsqueeze(0), skip_special_tokens=True
-    )[0].strip()
-    print(f"[chunk {chunk_idx + 1}] {partial!r}")
-
-# Final transcription
-transcription = processor.batch_decode(
-    accumulated_ids.unsqueeze(0), skip_special_tokens=True
-)[0].strip()
-print(transcription)
+text = processor.batch_decode(accumulated_ids.unsqueeze(0), skip_special_tokens=True)[0]
+print(text)
 ```
 
 #### Choosing a context size
 
-Smaller right context reduces latency at the cost of accuracy. Pass `att_context_size` to `encoder()` to select any trained context:
+Smaller right context reduces latency at the cost of accuracy. Pass `att_context_size` to the buffer constructor to select any trained context:
 
 ```python
-# Zero lookahead — lowest latency, fully causal
-enc_out = encoder(**inputs, use_cache=True, att_context_size=[70, 0], ...)
+buffer = ParakeetCacheAwareStreamingBuffer(model, processor, att_context_size=[70, 0])
 ```
-
-The chunk size parameters (`first_chunk_mel`, `chunk_mel`, `target_mel_len`) must be recomputed for each context size since they depend on `R = att_context_size[1]`.
 
 #### One-shot inference on full audio
 
@@ -374,3 +295,7 @@ outputs.loss.backward()
 ## ParakeetForCTC
 
 [[autodoc]] ParakeetForCTC
+
+## ParakeetCacheAwareStreamingBuffer
+
+[[autodoc]] ParakeetCacheAwareStreamingBuffer
