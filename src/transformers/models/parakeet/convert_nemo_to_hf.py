@@ -238,7 +238,6 @@ def convert_encoder_config(nemo_config):
         "feat_out",
         "stochastic_depth_drop_prob",
         "_target_",
-        "ff_expansion_factor",
         "untie_biases",
         "self_attention_model",
         "subsampling",
@@ -247,7 +246,16 @@ def convert_encoder_config(nemo_config):
         "reduction",
         "reduction_factor",
         "reduction_position",
+        # Multi-lookahead training-only sampling probs; inference uses the first context only.
+        "att_context_probs",
     ]
+    # ff_expansion_factor combines with d_model to give intermediate_size in HF.
+    ff_expansion = nemo_config["encoder"].get("ff_expansion_factor")
+    d_model = nemo_config["encoder"].get("d_model")
+    if ff_expansion is not None and d_model is not None:
+        nemo_config = {**nemo_config, "encoder": {**nemo_config["encoder"]}}
+        nemo_config["encoder"].pop("ff_expansion_factor")
+        nemo_config["encoder"]["__intermediate_size__"] = d_model * ff_expansion
     encoder_config_keys_mapping = {
         "d_model": "hidden_size",
         "n_heads": "num_attention_heads",
@@ -262,6 +270,8 @@ def convert_encoder_config(nemo_config):
         "dropout_att": "attention_dropout",
         "xscaling": "scale_input",
         "use_bias": "attention_bias",
+        # Derived from ff_expansion_factor * d_model in NeMo; consumed as hidden_size * factor here.
+        "__intermediate_size__": "intermediate_size",
         # Cache-aware (streaming-trained) fields — passed through verbatim.
         "att_context_size": "att_context_size",
         "att_context_style": "att_context_style",
@@ -303,7 +313,7 @@ def load_and_convert_state_dict(model_files):
 
 def write_ctc_model(encoder_config, converted_state_dict, output_dir, push_to_repo_id=None, revision=None):
     """Write CTC model using encoder config and converted state dict."""
-    model_config = ParakeetCTCConfig.from_encoder_config(encoder_config)
+    model_config = ParakeetCTCConfig(encoder_config=encoder_config.to_dict())
 
     print("Loading the checkpoint in a Parakeet CTC model.")
     with torch.device("meta"):
